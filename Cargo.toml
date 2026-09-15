@@ -1,0 +1,18 @@
+[workspace]
+resolver = "2"
+members = [
+    "hwr-ink",
+    "hwr-model",
+    "hwr-app",
+]
+# paddle-ocr-rs is a separate reference project (its own git repo), not part
+# of this workspace — exclude it so cargo doesn't try to fold it in.
+exclude = [
+    "paddle-ocr-rs",
+]
+
+[workspace.package]
+edition = "2021"
+
+[profile.dev.package."*"]
+opt-level = 2

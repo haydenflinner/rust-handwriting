@@ -1,0 +1,31 @@
+/target
+
+# Vendored reference material / external checkouts — not our code, kept
+# locally for reading/comparison only. See third_party/ for the one
+# exception (rustuna_core/rustuna_sampler): those are a real build
+# dependency, not just reference, so they're tracked.
+/armrest/
+/alps/
+/brush/
+/burn/
+/burn-spike/
+/lstm-ctc-ocr/
+/MathWriting-human/
+/paddle-ocr-rs/
+/rustuna/
+/sefaz-webservices-postman/
+/synthetic_handwriting.py
+/lstm-online-handwriting.pdf
+/mnist-dataset.zip
+*.html
+*_files/
+
+# Generated at runtime: trained checkpoints, training logs, the live
+# dashboard — reproducible from source + a training run, not source
+# themselves. `dashboard.html` matches the *.html rule above too.
+/checkpoints/
+
+# Generated training corpora (augmented/synthetic data, MNIST-as-vectors) —
+# large, regenerable via `augment`/`synth_glyphs`/whatever produced the
+# MNIST vector file, not source.
+/synthetic/

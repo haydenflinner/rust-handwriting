@@ -1,0 +1,39 @@
+[package]
+name = "rustuna_core"
+# Vendored copy of optuna/rustuna (github.com/optuna/rustuna, commit
+# 036a99a26d9ebb0a44a2fdeabe6131aae724d0b4) — the crates.io release of the
+# same name is an unrelated placeholder (`cargo info rustuna_core` there is
+# just a bare `lib.rs` reserving the name, no Study/Trial/Sampler code at
+# all), so this is the only usable source right now. Kept as our own copy
+# under third_party/ rather than depending on the separately-vendored
+# `rustuna/` reference checkout at the repo root, so that checkout stays
+# untouched/read-only.
+#
+# Literal package values, not `.workspace = true`: this crate is consumed
+# as a path dependency from hwr-model, which lives in a *different* Cargo
+# workspace. Cargo resolves workspace-inheritance against the single
+# workspace the whole build was invoked from, not each crate's own nearest
+# ancestor workspace — so inheriting here fails with "workspace.package.
+# version was not defined" as soon as this crate is pulled in from outside
+# its own original workspace.
+version = "0.1.0-dev"
+edition = "2021"
+description = "A Rust implementation of Optuna"
+repository = "https://github.com/optuna/rustuna"
+keywords = ["machine-learning"]
+categories = ["science"]
+license = "MIT"
+readme = "README.md"
+
+[dependencies]
+rand = "0.8.5"
+rand_distr = "0.4.3"
+
+# wasm32-unknown-unknown has no clock of its own, so the host's is read through `Date.now()`.
+# Being target-gated, no other target gains a dependency: the Python extension and native Rust
+# builds still resolve rustuna_core with `rand` alone.
+[target.'cfg(all(target_arch = "wasm32", target_os = "unknown"))'.dependencies]
+js-sys = "0.3.66"
+
+[dev-dependencies]
+statrs = "0.18.0"

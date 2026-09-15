@@ -1,0 +1,21 @@
+[package]
+name = "rustuna_sampler"
+# See rustuna_core/Cargo.toml's comment: vendored from optuna/rustuna under
+# third_party/ (not the separately-vendored root-level `rustuna/` reference
+# checkout), literal values instead of `.workspace = true` so it resolves
+# as a path dependency from hwr-model's separate workspace.
+version = "0.1.0-dev"
+edition = "2021"
+description = "A Rust implementation of Optuna"
+repository = "https://github.com/optuna/rustuna"
+keywords = ["machine-learning"]
+categories = ["science"]
+license = "MIT"
+
+[features]
+qmc = []
+
+[dependencies]
+rand = "0.8.5"
+rustuna_core = { path = "../rustuna_core" }
+serde_json = "1"

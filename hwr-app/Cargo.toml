@@ -1,0 +1,14 @@
+[package]
+name = "hwr-app"
+version = "0.1.0"
+edition.workspace = true
+
+[dependencies]
+bevy = "0.19.1"
+dirs = "7.0.0"
+hwr-ink = { path = "../hwr-ink" }
+hwr-model = { path = "../hwr-model" }
+
+[[bin]]
+name = "hwr-app"
+path = "src/main.rs"

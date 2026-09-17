@@ -11,7 +11,7 @@ default = ["vlm"]
 vlm = ["dep:oar-ocr-vl", "dep:image"]
 
 [dependencies]
-bevy = "0.19.1"
+bevy = { version = "0.19.1", features = ["system_font_discovery"] }
 dirs = "7.0.0"
 hwr-ink = { path = "../hwr-ink" }
 hwr-model = { path = "../hwr-model" }

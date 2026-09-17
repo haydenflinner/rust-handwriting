@@ -3,6 +3,7 @@
 
 use bevy::prelude::*;
 
+use crate::ui_theme::ui_font;
 use crate::writing_cell::stop_write_bubbling;
 
 #[derive(States, Clone, Copy, Eq, PartialEq, Hash, Debug, Default)]
@@ -59,10 +60,7 @@ fn mode_button(parent: &mut ChildSpawnerCommands, label: &str, mode: AppMode) {
         .with_children(|b| {
             b.spawn((
                 Text::new(label),
-                TextFont {
-                    font_size: FontSize::Px(18.0),
-                    ..default()
-                },
+                ui_font(18.0),
                 TextColor(Color::WHITE),
                 Pickable::IGNORE,
             ));

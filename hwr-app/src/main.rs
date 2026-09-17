@@ -9,6 +9,7 @@ mod prompts;
 mod review;
 mod storage;
 mod test_mode;
+mod ui_theme;
 #[cfg(feature = "vlm")]
 mod vlm;
 mod writing_cell;

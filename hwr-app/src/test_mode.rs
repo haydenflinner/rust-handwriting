@@ -2,6 +2,7 @@
 
 use std::collections::HashMap;
 
+use bevy::input::mouse::MouseScrollUnit;
 use bevy::prelude::*;
 
 use hwr_ink::ink::Ink;
@@ -9,6 +10,7 @@ use hwr_ink::ink::Ink;
 use crate::hunyuan_tasks::{self, HunyuanTask, TASKS};
 use crate::mode::AppMode;
 use crate::ocr::{OcrCheckpointSource, OcrClient, UiPointerDown};
+use crate::ui_theme::{result_font, ui_font};
 use crate::writing_cell::{make_writable, stop_write_bubbling, CellInk};
 
 /// Pause after the last pen-up before calling a VLM, so several digits or
@@ -18,6 +20,8 @@ const VLM_DEBOUNCE: f32 = 1.0;
 const MENU_BG: Color = Color::srgba(0.07, 0.07, 0.09, 0.96);
 const OPTION_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.08);
 const OPTION_SELECTED_BG: Color = Color::srgba(0.35, 0.55, 0.95, 0.4);
+const CARD_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
+const CARD_SELECTED_BG: Color = Color::srgba(0.35, 0.55, 0.95, 0.22);
 
 pub struct TestModePlugin;
 
@@ -31,7 +35,12 @@ impl Plugin for TestModePlugin {
             .add_systems(OnExit(AppMode::Test), hide_ui)
             .add_systems(
                 Update,
-                (clear_on_key, update_recognized_text, sync_task_dropdown)
+                (
+                    clear_on_key,
+                    update_recognized_text,
+                    sync_task_dropdown,
+                    sync_result_ui,
+                )
                     .chain()
                     .run_if(in_state(AppMode::Test)),
             );
@@ -57,6 +66,7 @@ struct VlTaskState {
     /// OCR job id → task id, so a prompt-switch still caches the in-flight job.
     submitted: HashMap<u64, String>,
     rerun: bool,
+    status: String,
 }
 
 impl Default for VlTaskState {
@@ -68,6 +78,7 @@ impl Default for VlTaskState {
             results: HashMap::new(),
             submitted: HashMap::new(),
             rerun: false,
+            status: String::new(),
         }
     }
 }
@@ -79,6 +90,7 @@ impl VlTaskState {
         self.submitted.clear();
         self.rerun = false;
         self.menu_open = false;
+        self.status.clear();
     }
 }
 
@@ -91,9 +103,6 @@ struct TestUiRoot;
 
 #[derive(Component)]
 struct RecognizedTextLabel;
-
-#[derive(Component)]
-struct TrialLogLabel;
 
 #[derive(Component)]
 struct TaskMenuHeaderLabel;
@@ -109,6 +118,15 @@ struct TaskOption(&'static str);
 
 #[derive(Component)]
 struct TaskDropdownRoot;
+
+#[derive(Component)]
+struct ResultsScroll;
+
+#[derive(Component)]
+struct TaskResultCard(&'static str);
+
+#[derive(Component)]
+struct TaskResultBody(&'static str);
 
 fn test_mode_hint(checkpoint: Option<&OcrCheckpointSource>, vlm: bool) -> String {
     let model = match checkpoint {
@@ -129,8 +147,7 @@ fn setup_ui(
 ) {
     let vlm = ocr.map(|ocr| ocr.is_vlm()).unwrap_or(false);
 
-    // A full-window (minus a little margin) writable canvas, behind the info
-    // panel. Plain background so it doesn't compete visually with the ink.
+    // A full-window writable canvas, behind the info panel.
     let mut canvas = commands.spawn((
         TestCanvas,
         Node {
@@ -154,45 +171,85 @@ fn setup_ui(
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(6.0),
                 padding: UiRect::all(Val::Px(8.0)),
-                max_width: Val::Px(720.0),
+                width: Val::Px(440.0),
+                max_height: Val::Vh(72.0),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.4)),
+            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
             Pickable::IGNORE,
             GlobalZIndex(10),
         ))
         .with_children(|root| {
             root.spawn((
                 Text::new(test_mode_hint(checkpoint.as_deref(), vlm)),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
+                ui_font(13.0),
                 TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
                 Pickable::IGNORE,
             ));
             if vlm {
                 spawn_task_dropdown(root);
             }
-            root.spawn((
-                Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(24.0),
-                    ..default()
-                },
-                TextColor(Color::WHITE),
-                RecognizedTextLabel,
-                Pickable::IGNORE,
+            spawn_results_scroll(root, vlm);
+        });
+}
+
+fn spawn_results_scroll(parent: &mut ChildSpawnerCommands, vlm: bool) {
+    let mut scroll = parent.spawn((
+        ResultsScroll,
+        Node {
+            flex_direction: FlexDirection::Column,
+            row_gap: Val::Px(8.0),
+            width: Val::Percent(100.0),
+            max_height: Val::Vh(52.0),
+            overflow: Overflow::scroll_y(),
+            padding: UiRect::all(Val::Px(4.0)),
+            ..default()
+        },
+        ScrollPosition::default(),
+        BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.15)),
+    ));
+    scroll.with_children(|col| {
+        col.spawn((
+            Text::new(""),
+            result_font(18.0),
+            TextColor(Color::WHITE),
+            RecognizedTextLabel,
+        ));
+        if vlm {
+            for task in TASKS {
+                spawn_result_card(col, task);
+            }
+        }
+    });
+    scroll.observe(scroll_overflow);
+    stop_write_bubbling(&mut scroll);
+}
+
+fn spawn_result_card(parent: &mut ChildSpawnerCommands, task: &'static HunyuanTask) {
+    parent
+        .spawn((
+            TaskResultCard(task.id),
+            Visibility::Hidden,
+            Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(4.0),
+                width: Val::Percent(100.0),
+                padding: UiRect::all(Val::Px(8.0)),
+                ..default()
+            },
+            BackgroundColor(CARD_BG),
+        ))
+        .with_children(|card| {
+            card.spawn((
+                Text::new(format!("{}  —  {}", task.id, task.blurb)),
+                ui_font(12.0),
+                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.7)),
             ));
-            root.spawn((
+            card.spawn((
                 Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
-                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.55)),
-                TrialLogLabel,
-                Pickable::IGNORE,
+                result_font(14.0),
+                TextColor(Color::WHITE),
+                TaskResultBody(task.id),
             ));
         });
 }
@@ -204,7 +261,9 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
             Node {
                 flex_direction: FlexDirection::Column,
                 row_gap: Val::Px(4.0),
-                align_items: AlignItems::FlexStart,
+                align_items: AlignItems::Stretch,
+                width: Val::Percent(100.0),
+                flex_shrink: 0.0,
                 ..default()
             },
         ))
@@ -213,7 +272,7 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                 Button,
                 Node {
                     padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
-                    min_width: Val::Px(320.0),
+                    width: Val::Percent(100.0),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.14)),
@@ -222,10 +281,7 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                 .with_children(|b| {
                     b.spawn((
                         Text::new(""),
-                        TextFont {
-                            font_size: FontSize::Px(15.0),
-                            ..default()
-                        },
+                        ui_font(15.0),
                         TextColor(Color::WHITE),
                         TaskMenuHeaderLabel,
                         Pickable::IGNORE,
@@ -246,9 +302,12 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                     flex_direction: FlexDirection::Column,
                     row_gap: Val::Px(2.0),
                     padding: UiRect::all(Val::Px(4.0)),
-                    min_width: Val::Px(360.0),
+                    width: Val::Percent(100.0),
+                    max_height: Val::Vh(40.0),
+                    overflow: Overflow::scroll_y(),
                     ..default()
                 },
+                ScrollPosition::default(),
                 BackgroundColor(MENU_BG),
                 GlobalZIndex(110),
             ))
@@ -256,15 +315,13 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                 for task in TASKS {
                     spawn_task_option(list, task);
                 }
-            });
+            })
+            .observe(scroll_overflow);
 
             col.spawn((
                 Text::new(""),
-                TextFont {
-                    font_size: FontSize::Px(12.0),
-                    ..default()
-                },
-                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.5)),
+                ui_font(12.0),
+                TextColor(Color::srgba(1.0, 1.0, 1.0, 0.55)),
                 TaskPromptPreview,
                 Pickable::IGNORE,
             ));
@@ -287,10 +344,7 @@ fn spawn_task_option(parent: &mut ChildSpawnerCommands, task: &'static HunyuanTa
         .with_children(|b| {
             b.spawn((
                 Text::new(format!("{id}  —  {}", task.blurb)),
-                TextFont {
-                    font_size: FontSize::Px(13.0),
-                    ..default()
-                },
+                ui_font(13.0),
                 TextColor(Color::WHITE),
                 Pickable::IGNORE,
             ));
@@ -306,6 +360,21 @@ fn spawn_task_option(parent: &mut ChildSpawnerCommands, task: &'static HunyuanTa
             },
         );
     stop_write_bubbling(&mut button);
+}
+
+fn scroll_overflow(
+    on_scroll: On<Pointer<Scroll>>,
+    mut query: Query<(&mut ScrollPosition, &ComputedNode)>,
+) {
+    let Ok((mut scroll_position, node)) = query.get_mut(on_scroll.observer()) else {
+        return;
+    };
+    let dy = match on_scroll.unit {
+        MouseScrollUnit::Line => on_scroll.y * 24.0,
+        MouseScrollUnit::Pixel => on_scroll.y,
+    };
+    let range = (node.content_size.y - node.size.y).max(0.0) * node.inverse_scale_factor;
+    scroll_position.y = (scroll_position.y - dy).clamp(0.0, range);
 }
 
 fn show_ui(mut roots: Query<&mut Visibility, Or<(With<TestUiRoot>, With<TestCanvas>)>>) {
@@ -328,17 +397,23 @@ fn clear_canvas(
     mut canvas: Query<&mut CellInk, With<TestCanvas>>,
     mut pending: ResMut<PendingOcr>,
     mut state: ResMut<VlTaskState>,
+    mut recognized: ResMut<RecognizedText>,
+    mut scroll: Query<&mut ScrollPosition, With<ResultsScroll>>,
     ocr: Option<NonSendMut<OcrClient>>,
     writing: Res<UiPointerDown>,
 ) {
     pending.ink = None;
     state.forget_ink();
+    recognized.0.clear();
     writing.set(false);
     if let Some(mut ocr) = ocr {
         ocr.cancel();
     }
     for mut cell in &mut canvas {
         cell.clear();
+    }
+    for mut pos in &mut scroll {
+        pos.0 = Vec2::ZERO;
     }
 }
 
@@ -348,8 +423,7 @@ fn clear_on_key(
     mut pending: ResMut<PendingOcr>,
     mut state: ResMut<VlTaskState>,
     mut recognized: ResMut<RecognizedText>,
-    mut labels: Query<&mut Text, With<RecognizedTextLabel>>,
-    mut logs: Query<&mut Text, (With<TrialLogLabel>, Without<RecognizedTextLabel>)>,
+    mut scroll: Query<&mut ScrollPosition, With<ResultsScroll>>,
     ocr: Option<NonSendMut<OcrClient>>,
     writing: Res<UiPointerDown>,
 ) {
@@ -364,11 +438,8 @@ fn clear_on_key(
         for mut cell in &mut canvas {
             cell.clear();
         }
-        for mut label in &mut labels {
-            label.0.clear();
-        }
-        for mut log in &mut logs {
-            log.0.clear();
+        for mut pos in &mut scroll {
+            pos.0 = Vec2::ZERO;
         }
     }
 }
@@ -379,8 +450,6 @@ fn update_recognized_text(
     mut pending: ResMut<PendingOcr>,
     mut state: ResMut<VlTaskState>,
     ocr: Option<NonSendMut<OcrClient>>,
-    mut labels: Query<&mut Text, With<RecognizedTextLabel>>,
-    mut logs: Query<&mut Text, (With<TrialLogLabel>, Without<RecognizedTextLabel>)>,
     time: Res<Time>,
 ) {
     let Ok(mut cell) = canvas.single_mut() else {
@@ -391,17 +460,10 @@ fn update_recognized_text(
     while let Some((id, current, result)) = ocr.poll() {
         if ocr.is_vlm() {
             if let Some(task) = state.submitted.remove(&id) {
-                apply_vlm_result(
-                    result,
-                    &task,
-                    &mut state,
-                    &mut recognized,
-                    &mut labels,
-                    &mut logs,
-                );
+                apply_vlm_result(result, &task, &mut state, &mut recognized);
             }
         } else if current {
-            apply_result(result, &mut recognized, &mut labels);
+            apply_hat_result(result, &mut recognized);
         }
     }
 
@@ -422,7 +484,8 @@ fn update_recognized_text(
             pending.due = time.elapsed_secs() + VLM_DEBOUNCE;
         } else {
             pending.ink = None;
-            submit_hat(&mut ocr, cell.ink.clone(), &mut labels);
+            ocr.submit(cell.ink.clone(), None);
+            recognized.0 = "recognizing…".to_string();
         }
     }
 
@@ -430,9 +493,9 @@ fn update_recognized_text(
         state.rerun = false;
         if pending.ink.is_none() {
             if state.results.contains_key(&state.selected) {
-                show_cached(&state, &mut recognized, &mut labels, &mut logs);
+                show_cached(&state, &mut recognized);
             } else if let Some(ink) = state.last_ink.clone() {
-                submit_vlm(&mut ocr, ink, &mut state, &mut labels, &mut logs);
+                submit_vlm(&mut ocr, ink, &mut state, &mut recognized);
             }
         }
     }
@@ -442,21 +505,11 @@ fn update_recognized_text(
         if ocr.is_vlm() {
             state.last_ink = Some(ink.clone());
             state.results.clear();
-            submit_vlm(&mut ocr, ink, &mut state, &mut labels, &mut logs);
+            submit_vlm(&mut ocr, ink, &mut state, &mut recognized);
         } else {
-            submit_hat(&mut ocr, ink, &mut labels);
+            ocr.submit(ink, None);
+            recognized.0 = "recognizing…".to_string();
         }
-    }
-}
-
-fn submit_hat(
-    ocr: &mut OcrClient,
-    ink: Ink,
-    labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
-) {
-    ocr.submit(ink, None);
-    for mut label in labels.iter_mut() {
-        label.0 = "recognizing…".to_string();
     }
 }
 
@@ -464,8 +517,7 @@ fn submit_vlm(
     ocr: &mut OcrClient,
     ink: Ink,
     state: &mut VlTaskState,
-    labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
-    logs: &mut Query<&mut Text, (With<TrialLogLabel>, Without<RecognizedTextLabel>)>,
+    recognized: &mut RecognizedText,
 ) {
     let prompt = hunyuan_tasks::prompt_for(&state.selected)
         .unwrap_or_else(|| hunyuan_tasks::prompt_for(hunyuan_tasks::DEFAULT_TASK_ID).unwrap())
@@ -473,12 +525,8 @@ fn submit_vlm(
     let task = state.selected.clone();
     let id = ocr.submit(ink, Some(prompt));
     state.submitted.insert(id, task.clone());
-    for mut label in labels.iter_mut() {
-        label.0 = format!("recognizing {task}…");
-    }
-    for mut log in logs.iter_mut() {
-        log.0 = format_trial_log(state);
-    }
+    state.status = format!("recognizing {task}…");
+    recognized.0 = state.status.clone();
 }
 
 fn apply_vlm_result(
@@ -486,8 +534,6 @@ fn apply_vlm_result(
     task: &str,
     state: &mut VlTaskState,
     recognized: &mut RecognizedText,
-    labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
-    logs: &mut Query<&mut Text, (With<TrialLogLabel>, Without<RecognizedTextLabel>)>,
 ) {
     match result {
         Ok(text) => {
@@ -500,89 +546,26 @@ fn apply_vlm_result(
                 .insert(task.to_string(), format!("(error: {err})"));
         }
     }
+    if state.submitted.is_empty() {
+        state.status.clear();
+    }
     if task == state.selected {
-        show_cached(state, recognized, labels, logs);
-    } else {
-        for mut log in logs.iter_mut() {
-            log.0 = format_trial_log(state);
-        }
+        show_cached(state, recognized);
     }
 }
 
-fn show_cached(
-    state: &VlTaskState,
-    recognized: &mut RecognizedText,
-    labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
-    logs: &mut Query<&mut Text, (With<TrialLogLabel>, Without<RecognizedTextLabel>)>,
-) {
+fn show_cached(state: &VlTaskState, recognized: &mut RecognizedText) {
     recognized.0 = state
         .results
         .get(&state.selected)
         .cloned()
-        .unwrap_or_default();
-    for mut label in labels.iter_mut() {
-        label.0 = if recognized.0.is_empty() {
-            "(empty)".to_string()
-        } else {
-            recognized.0.clone()
-        };
-    }
-    for mut log in logs.iter_mut() {
-        log.0 = format_trial_log(state);
-    }
+        .unwrap_or_else(|| state.status.clone());
 }
 
-fn format_trial_log(state: &VlTaskState) -> String {
-    if state.results.is_empty() {
-        return String::new();
-    }
-    let mut lines = Vec::new();
-    for task in TASKS {
-        let Some(text) = state.results.get(task.id) else {
-            continue;
-        };
-        let mark = if task.id == state.selected {
-            "▸"
-        } else {
-            " "
-        };
-        lines.push(format!("{mark} {}: {}", task.id, clip(text, 240)));
-    }
-    if lines.len() > 1 {
-        lines.join("\n")
-    } else {
-        String::new()
-    }
-}
-
-fn clip(text: &str, max_chars: usize) -> String {
-    let count = text.chars().count();
-    if count <= max_chars {
-        text.to_string()
-    } else {
-        format!("{}…", text.chars().take(max_chars).collect::<String>())
-    }
-}
-
-fn apply_result(
-    result: Result<String, String>,
-    recognized: &mut RecognizedText,
-    labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
-) {
+fn apply_hat_result(result: Result<String, String>, recognized: &mut RecognizedText) {
     match result {
         Ok(text) => recognized.0 = text,
-        Err(err) => {
-            eprintln!("recognition failed: {err}");
-            return;
-        }
-    }
-
-    for mut label in labels.iter_mut() {
-        label.0 = if recognized.0.is_empty() {
-            "(empty)".to_string()
-        } else {
-            recognized.0.clone()
-        };
+        Err(err) => eprintln!("recognition failed: {err}"),
     }
 }
 
@@ -619,5 +602,39 @@ fn sync_task_dropdown(
         } else {
             OPTION_BG
         });
+    }
+}
+
+fn sync_result_ui(
+    recognized: Res<RecognizedText>,
+    state: Res<VlTaskState>,
+    mut labels: Query<&mut Text, With<RecognizedTextLabel>>,
+    mut cards: Query<(&TaskResultCard, &mut Visibility, &mut BackgroundColor)>,
+    mut bodies: Query<(&TaskResultBody, &mut Text), Without<RecognizedTextLabel>>,
+) {
+    let current = if recognized.0.is_empty() {
+        String::new()
+    } else {
+        recognized.0.clone()
+    };
+    for mut label in &mut labels {
+        label.0 = current.clone();
+    }
+
+    for (card, mut vis, mut bg) in &mut cards {
+        let has = state.results.contains_key(card.0);
+        *vis = if has {
+            Visibility::Inherited
+        } else {
+            Visibility::Hidden
+        };
+        *bg = BackgroundColor(if card.0 == state.selected {
+            CARD_SELECTED_BG
+        } else {
+            CARD_BG
+        });
+    }
+    for (body, mut text) in &mut bodies {
+        text.0 = state.results.get(body.0).cloned().unwrap_or_default();
     }
 }

@@ -1,4 +1,5 @@
 mod calibrate;
+mod gpu_gate;
 #[cfg(feature = "vlm")]
 mod ink_image;
 mod mode;
@@ -26,6 +27,7 @@ fn main() {
         }))
         .insert_resource(ClearColor(BACKGROUND))
         .add_plugins((
+            gpu_gate::GpuGatePlugin,
             writing_cell::WritingCellPlugin,
             ocr::OcrPlugin,
             mode::ModePlugin,

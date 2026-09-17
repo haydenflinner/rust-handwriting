@@ -11,21 +11,25 @@
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
+use std::time::Instant;
 
 use hwr_ink::ink::Ink;
+
+use crate::ocr::UiPointerDown;
 
 pub struct WritingCellPlugin;
 
 impl Plugin for WritingCellPlugin {
     fn build(&self, app: &mut App) {
-        app.add_systems(Update, draw_cell_ink);
+        app.add_systems(Update, draw_cell_ink)
+            .add_systems(Last, sync_ui_pointer_down);
     }
 }
 
 /// The ink accumulated by one writing cell. `just_finished` is set on pen-up
 /// (one stroke completed) — consumers (e.g. test mode's recognizer) should
 /// check and clear it.
-#[derive(Component, Default)]
+#[derive(Component)]
 pub struct CellInk {
     pub ink: Ink,
     pub just_finished: bool,
@@ -33,7 +37,19 @@ pub struct CellInk {
     /// calibration mode uses it to show a running per-prompt count.
     pub saved_count: usize,
     pen_down: bool,
-    stroke_start: f32,
+    stroke_start: Instant,
+}
+
+impl Default for CellInk {
+    fn default() -> Self {
+        Self {
+            ink: Ink::new(),
+            just_finished: false,
+            saved_count: 0,
+            pen_down: false,
+            stroke_start: Instant::now(),
+        }
+    }
 }
 
 impl CellInk {
@@ -43,6 +59,17 @@ impl CellInk {
         self.pen_down = false;
         self.just_finished = false;
     }
+
+    pub fn is_writing(&self) -> bool {
+        self.pen_down
+    }
+}
+
+fn sync_ui_pointer_down(cells: Query<&CellInk>, writing: Option<Res<UiPointerDown>>) {
+    let Some(writing) = writing else {
+        return;
+    };
+    writing.set(cells.iter().any(|cell| cell.pen_down));
 }
 
 /// Make `entity` writable: attach a `CellInk` and the pointer observers that
@@ -63,7 +90,11 @@ pub fn stop_write_bubbling(entity: &mut EntityCommands) {
     entity.observe(|mut trigger: On<Pointer<Release>>| trigger.propagate(false));
 }
 
-fn on_press(trigger: On<Pointer<Press>>, mut cells: Query<&mut CellInk>, time: Res<Time>) {
+fn on_press(
+    trigger: On<Pointer<Press>>,
+    mut cells: Query<&mut CellInk>,
+    writing: Res<UiPointerDown>,
+) {
     if trigger.event.button != PointerButton::Primary {
         return;
     }
@@ -72,11 +103,12 @@ fn on_press(trigger: On<Pointer<Press>>, mut cells: Query<&mut CellInk>, time: R
     };
     let pos = trigger.pointer_location.position;
     cell.pen_down = true;
-    cell.stroke_start = time.elapsed_secs();
+    cell.stroke_start = Instant::now();
+    writing.set(true);
     cell.ink.push(pos.x, pos.y, 0.0);
 }
 
-fn on_drag(trigger: On<Pointer<Drag>>, mut cells: Query<&mut CellInk>, time: Res<Time>) {
+fn on_drag(trigger: On<Pointer<Drag>>, mut cells: Query<&mut CellInk>) {
     let Ok(mut cell) = cells.get_mut(trigger.entity) else {
         return;
     };
@@ -84,11 +116,15 @@ fn on_drag(trigger: On<Pointer<Drag>>, mut cells: Query<&mut CellInk>, time: Res
         return;
     }
     let pos = trigger.pointer_location.position;
-    let dt = time.elapsed_secs() - cell.stroke_start;
+    let dt = cell.stroke_start.elapsed().as_secs_f32();
     cell.ink.push(pos.x, pos.y, dt);
 }
 
-fn on_release(trigger: On<Pointer<Release>>, mut cells: Query<&mut CellInk>, time: Res<Time>) {
+fn on_release(
+    trigger: On<Pointer<Release>>,
+    mut cells: Query<&mut CellInk>,
+    writing: Res<UiPointerDown>,
+) {
     if trigger.event.button != PointerButton::Primary {
         return;
     }
@@ -99,11 +135,12 @@ fn on_release(trigger: On<Pointer<Release>>, mut cells: Query<&mut CellInk>, tim
         return;
     }
     let pos = trigger.pointer_location.position;
-    let dt = time.elapsed_secs() - cell.stroke_start;
+    let dt = cell.stroke_start.elapsed().as_secs_f32();
     cell.ink.push(pos.x, pos.y, dt);
     cell.ink.pen_up();
     cell.pen_down = false;
     cell.just_finished = true;
+    writing.set(false);
 }
 
 const STROKE_COLOR: Color = Color::srgb(0.9, 0.9, 0.95);

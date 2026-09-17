@@ -4,9 +4,10 @@ version = "0.1.0"
 edition.workspace = true
 
 [features]
-default = []
-# Local VLM OCR via oar-ocr-vl + HunyuanOCR. Off by default so a
-# normal `cargo run -p hwr-app` still only builds the HAT recognizer.
+default = ["vlm"]
+# Local VLM OCR via oar-ocr-vl + HunyuanOCR. Default so `cargo run -p hwr-app`
+# uses Hunyuan when the checkpoint is present; `HWR_OCR_BACKEND=hat` still
+# selects the CTC recognizer. `--no-default-features` skips the VLM crate.
 vlm = ["dep:oar-ocr-vl", "dep:image"]
 
 [dependencies]

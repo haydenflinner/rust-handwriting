@@ -5,12 +5,12 @@ use bevy::prelude::*;
 use hwr_ink::ink::Ink;
 
 use crate::mode::AppMode;
-use crate::ocr::{OcrCheckpointSource, OcrRecognizer};
+use crate::ocr::{OcrCheckpointSource, OcrClient, UiPointerDown};
 use crate::writing_cell::{make_writable, CellInk};
 
-/// Pause after the last pen-up before calling a VLM, so a word written as
-/// several strokes is recognized once instead of once per letter.
-const VLM_DEBOUNCE: f32 = 0.45;
+/// Pause after the last pen-up before calling a VLM, so several digits or
+/// letters written as separate strokes are recognized once.
+const VLM_DEBOUNCE: f32 = 1.0;
 
 pub struct TestModePlugin;
 
@@ -23,7 +23,9 @@ impl Plugin for TestModePlugin {
             .add_systems(OnExit(AppMode::Test), hide_ui)
             .add_systems(
                 Update,
-                (clear_on_key, update_recognized_text).run_if(in_state(AppMode::Test)),
+                (clear_on_key, update_recognized_text)
+                    .chain()
+                    .run_if(in_state(AppMode::Test)),
             );
     }
 }
@@ -35,7 +37,6 @@ struct RecognizedText(String);
 struct PendingOcr {
     ink: Option<Ink>,
     due: f32,
-    primed: bool,
 }
 
 /// The single full-window writing surface used by test mode.
@@ -121,9 +122,14 @@ fn hide_ui(mut roots: Query<&mut Visibility, Or<(With<TestUiRoot>, With<TestCanv
 fn clear_canvas(
     mut canvas: Query<&mut CellInk, With<TestCanvas>>,
     mut pending: ResMut<PendingOcr>,
+    ocr: Option<NonSendMut<OcrClient>>,
+    writing: Res<UiPointerDown>,
 ) {
     pending.ink = None;
-    pending.primed = false;
+    writing.set(false);
+    if let Some(mut ocr) = ocr {
+        ocr.cancel();
+    }
     for mut cell in &mut canvas {
         cell.clear();
     }
@@ -133,10 +139,15 @@ fn clear_on_key(
     keys: Res<ButtonInput<KeyCode>>,
     mut canvas: Query<&mut CellInk, With<TestCanvas>>,
     mut pending: ResMut<PendingOcr>,
+    ocr: Option<NonSendMut<OcrClient>>,
+    writing: Res<UiPointerDown>,
 ) {
     if keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Escape) {
         pending.ink = None;
-        pending.primed = false;
+        writing.set(false);
+        if let Some(mut ocr) = ocr {
+            ocr.cancel();
+        }
         for mut cell in &mut canvas {
             cell.clear();
         }
@@ -147,53 +158,58 @@ fn update_recognized_text(
     mut canvas: Query<&mut CellInk, With<TestCanvas>>,
     mut recognized: ResMut<RecognizedText>,
     mut pending: ResMut<PendingOcr>,
-    ocr: Option<NonSend<OcrRecognizer>>,
+    ocr: Option<NonSendMut<OcrClient>>,
     mut labels: Query<&mut Text, With<RecognizedTextLabel>>,
     time: Res<Time>,
 ) {
     let Ok(mut cell) = canvas.single_mut() else {
         return;
     };
-    let Some(ocr) = ocr else { return };
+    let Some(mut ocr) = ocr else { return };
+
+    if let Some(result) = ocr.poll() {
+        apply_result(result, &mut recognized, &mut labels);
+    }
+
+    if ocr.is_vlm() && cell.is_writing() {
+        // A new stroke started: drop any in-flight job so Metal is free, and
+        // wait until 1s after this stroke (and any that follow) before trying
+        // again.
+        ocr.cancel();
+        pending.ink = None;
+        return;
+    }
 
     if cell.just_finished {
         cell.just_finished = false;
         if ocr.is_vlm() {
             pending.ink = Some(cell.ink.clone());
             pending.due = time.elapsed_secs() + VLM_DEBOUNCE;
-            pending.primed = false;
         } else {
-            apply_recognition(&ocr, &cell.ink, &mut recognized, &mut labels);
+            pending.ink = None;
+            submit(&mut ocr, cell.ink.clone(), &mut labels);
         }
-        return;
     }
 
-    if pending.ink.is_none() {
-        return;
+    if pending.ink.is_some() && !cell.is_writing() && time.elapsed_secs() >= pending.due {
+        let ink = pending.ink.take().expect("pending ink was Some");
+        submit(&mut ocr, ink, &mut labels);
     }
-    if time.elapsed_secs() < pending.due {
-        return;
-    }
-    if !pending.primed {
-        // One frame so "recognizing…" can paint before Metal inference blocks.
-        pending.primed = true;
-        for mut label in &mut labels {
-            label.0 = "recognizing…".to_string();
-        }
-        return;
-    }
-    let ink = pending.ink.take().expect("pending ink was Some");
-    pending.primed = false;
-    apply_recognition(&ocr, &ink, &mut recognized, &mut labels);
 }
 
-fn apply_recognition(
-    ocr: &OcrRecognizer,
-    ink: &Ink,
+fn submit(ocr: &mut OcrClient, ink: Ink, labels: &mut Query<&mut Text, With<RecognizedTextLabel>>) {
+    ocr.submit(ink);
+    for mut label in labels.iter_mut() {
+        label.0 = "recognizing…".to_string();
+    }
+}
+
+fn apply_result(
+    result: Result<String, String>,
     recognized: &mut RecognizedText,
     labels: &mut Query<&mut Text, With<RecognizedTextLabel>>,
 ) {
-    match ocr.recognize(ink) {
+    match result {
         Ok(text) => recognized.0 = text,
         Err(err) => {
             eprintln!("recognition failed: {err}");

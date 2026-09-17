@@ -1,12 +1,14 @@
 //! HunyuanOCR backend: rasterize ink, then transcribe handwriting.
 
 use std::path::Path;
+use std::sync::atomic::AtomicBool;
 use std::time::Instant;
 
 use hwr_ink::ink::Ink;
 use oar_ocr_vl::utils::parse_device;
 use oar_ocr_vl::HunyuanOcr;
 
+use crate::gpu_gate::{wait_while_writing, GpuGate};
 use crate::ink_image::rasterize_ink_rgb;
 
 /// Short crop of stylus ink, not a full document page. Hunyuan's default
@@ -22,9 +24,9 @@ impl VlmOcr {
         let model_dir = model_dir.as_ref();
         // Candle's Metal path is fastest in f16 on Apple Silicon; Auto would
         // prefer bf16 when the probe succeeds, which is slower here.
+        // SAFETY: called once on the OCR worker at load, before generate
+        // and before Bevy starts extra work on this thread.
         if std::env::var_os("OAR_VL_DTYPE").is_none() {
-            // SAFETY: called once on the main thread at PreStartup, before
-            // the recognizer is used and before Bevy starts extra work.
             unsafe {
                 std::env::set_var("OAR_VL_DTYPE", "f16");
             }
@@ -74,7 +76,13 @@ impl VlmOcr {
         )
     }
 
-    pub fn recognize(&self, ink: &Ink) -> Result<String, String> {
+    pub fn recognize(
+        &self,
+        ink: &Ink,
+        writing: &AtomicBool,
+        gpu: &GpuGate,
+    ) -> Result<String, String> {
+        wait_while_writing(writing);
         let Some(image) = rasterize_ink_rgb(ink) else {
             return Ok(String::new());
         };
@@ -91,9 +99,18 @@ impl VlmOcr {
         let prompt =
             std::env::var("HWR_VL_PROMPT").unwrap_or_else(|_| HANDWRITING_PROMPT.to_string());
         let start = Instant::now();
+        gpu.ocr_acquire(writing);
+        let _hold = gpu.ocr_hold();
         let outputs = self
             .model
-            .generate(&[image], &[prompt.as_str()], 256)
+            .generate_with_step(&[image], &[prompt.as_str()], 256, || {
+                // Drain this layer's Metal work while we still hold the GPU
+                // token, then let Bevy render before the next layer/token.
+                let _ = self.model.device().synchronize();
+                gpu.ocr_release();
+                wait_while_writing(writing);
+                gpu.ocr_acquire(writing);
+            })
             .map_err(|err| err.to_string())?;
         let text = outputs
             .into_iter()

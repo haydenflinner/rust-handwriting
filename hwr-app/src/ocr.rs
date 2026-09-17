@@ -1,11 +1,23 @@
 //! The recognizer, loaded once at startup from the pretrained checkpoint
 //! or (with `--features vlm`) from a local HunyuanOCR directory.
+//!
+//! Inference runs on a dedicated worker thread so Hunyuan (or HAT) cannot
+//! stall Bevy's input/render loop. Only [`Ink`] and the decoded string cross
+//! the channel; the model never leaves the worker.
+//!
+//! Hunyuan and Bevy share one Metal GPU, so they take turns via a GPU token.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::Arc;
+use std::thread;
 
 use bevy::prelude::*;
 use hwr_ink::ink::Ink;
 use hwr_model::Recognizer;
+
+use crate::gpu_gate::GpuGate;
 
 /// Pretrained on armrest's bundled `data/inks/*.txt` corpus — see
 /// `hwr-model/src/bin/train.rs`. Embedded so a packaged app doesn't depend
@@ -17,31 +29,93 @@ use hwr_model::Recognizer;
 /// so `hwr-app` can pick up the current PBT `--out` without a rebuild.
 static CHECKPOINT: &[u8] = include_bytes!("../../checkpoints/model.mpk");
 
-/// `NonSend` because candle's CPU tensors aren't required to be `Sync`, and
-/// we only ever touch the recognizer from the main thread anyway.
-pub struct OcrRecognizer(pub OcrEngine);
+struct OcrEngine {
+    inner: OcrBackend,
+}
 
-pub enum OcrEngine {
+enum OcrBackend {
     Hat(Recognizer),
     #[cfg(feature = "vlm")]
     Vlm(crate::vlm::VlmOcr),
 }
 
-impl OcrRecognizer {
-    pub fn recognize(&self, ink: &Ink) -> Result<String, String> {
-        match &self.0 {
-            OcrEngine::Hat(rec) => rec.recognize_greedy(ink).map_err(|err| err.to_string()),
+impl OcrEngine {
+    fn recognize(&self, ink: &Ink, writing: &AtomicBool, gpu: &GpuGate) -> Result<String, String> {
+        match &self.inner {
+            OcrBackend::Hat(rec) => {
+                gpu.ocr_acquire(writing);
+                let _hold = gpu.ocr_hold();
+                rec.recognize_greedy(ink).map_err(|err| err.to_string())
+            }
             #[cfg(feature = "vlm")]
-            OcrEngine::Vlm(vlm) => vlm.recognize(ink),
+            OcrBackend::Vlm(vlm) => vlm.recognize(ink, writing, gpu),
         }
     }
 
-    pub fn is_vlm(&self) -> bool {
-        match &self.0 {
-            OcrEngine::Hat(_) => false,
+    fn is_vlm(&self) -> bool {
+        match &self.inner {
+            OcrBackend::Hat(_) => false,
             #[cfg(feature = "vlm")]
-            OcrEngine::Vlm(_) => true,
+            OcrBackend::Vlm(_) => true,
         }
+    }
+}
+
+/// Main-thread handle to the OCR worker. `NonSend` because `mpsc::Receiver`
+/// isn't `Sync`; we only poll it from the Bevy main thread anyway.
+pub struct OcrClient {
+    req_tx: Sender<(u64, Ink)>,
+    res_rx: Receiver<(u64, Result<String, String>)>,
+    next_id: u64,
+    inflight: Option<u64>,
+    is_vlm: bool,
+}
+
+impl OcrClient {
+    pub fn is_vlm(&self) -> bool {
+        self.is_vlm
+    }
+
+    pub fn submit(&mut self, ink: Ink) {
+        self.next_id += 1;
+        let id = self.next_id;
+        self.inflight = Some(id);
+        if self.req_tx.send((id, ink)).is_err() {
+            eprintln!("ocr: worker thread is gone");
+            self.inflight = None;
+        }
+    }
+
+    /// Apply a completed job if it is still the latest submit. Stale results
+    /// (superseded strokes, or a clear while inference was running) are dropped.
+    pub fn poll(&mut self) -> Option<Result<String, String>> {
+        loop {
+            match self.res_rx.try_recv() {
+                Ok((id, result)) => {
+                    if self.inflight == Some(id) {
+                        self.inflight = None;
+                        return Some(result);
+                    }
+                }
+                Err(_) => return None,
+            }
+        }
+    }
+
+    pub fn cancel(&mut self) {
+        self.next_id += 1;
+        self.inflight = None;
+    }
+}
+
+/// Shared with the OCR worker: true while a stroke is in progress so Metal
+/// inference can park and let Bevy keep the GPU.
+#[derive(Resource, Clone)]
+pub struct UiPointerDown(pub Arc<AtomicBool>);
+
+impl UiPointerDown {
+    pub fn set(&self, down: bool) {
+        self.0.store(down, Ordering::Release);
     }
 }
 
@@ -54,16 +128,85 @@ pub struct OcrPlugin;
 
 impl Plugin for OcrPlugin {
     fn build(&self, app: &mut App) {
+        app.insert_resource(UiPointerDown(Arc::new(AtomicBool::new(false))));
         // PreStartup so test-mode UI can read `OcrCheckpointSource` on Startup.
         app.add_systems(PreStartup, setup_recognizer);
     }
 }
 
 fn setup_recognizer(world: &mut World) {
-    let (recognizer, source) = load_recognizer();
+    let (req_tx, req_rx) = mpsc::channel::<(u64, Ink)>();
+    let (res_tx, res_rx) = mpsc::channel::<(u64, Result<String, String>)>();
+    let (ready_tx, ready_rx) = mpsc::sync_channel::<(String, bool)>(1);
+    let writing = world.resource::<UiPointerDown>().0.clone();
+    let gpu = world.resource::<GpuGate>().clone();
+
+    thread::Builder::new()
+        .name("hwr-ocr".into())
+        .spawn(move || {
+            demote_worker_qos();
+            gpu.ocr_acquire(&writing);
+            let (engine, source) = load_recognizer();
+            gpu.ocr_release();
+            let is_vlm = engine.is_vlm();
+            if ready_tx.send((source, is_vlm)).is_err() {
+                return;
+            }
+            ocr_worker(engine, req_rx, res_tx, writing, gpu);
+        })
+        .expect("failed to spawn OCR worker thread");
+
+    let (source, is_vlm) = ready_rx
+        .recv()
+        .expect("OCR worker died while loading the recognizer");
     eprintln!("ocr: loaded {source}");
     world.insert_resource(OcrCheckpointSource(source));
-    world.insert_non_send(recognizer);
+    world.insert_non_send(OcrClient {
+        req_tx,
+        res_rx,
+        next_id: 0,
+        inflight: None,
+        is_vlm,
+    });
+}
+
+fn ocr_worker(
+    engine: OcrEngine,
+    req_rx: Receiver<(u64, Ink)>,
+    res_tx: Sender<(u64, Result<String, String>)>,
+    writing: Arc<AtomicBool>,
+    gpu: GpuGate,
+) {
+    loop {
+        let (mut id, mut ink) = match req_rx.recv() {
+            Ok(job) => job,
+            Err(_) => break,
+        };
+        // Keep only the newest queued stroke so a word written while a
+        // previous Hunyuan call is still running doesn't back up.
+        while let Ok((next_id, next_ink)) = req_rx.try_recv() {
+            id = next_id;
+            ink = next_ink;
+        }
+        let result = engine.recognize(&ink, &writing, &gpu);
+        if res_tx.send((id, result)).is_err() {
+            break;
+        }
+    }
+}
+
+/// Drop below Bevy's UI thread so macOS prefers interactive cores / GPU for
+/// sampling and drawing. Candle's rayon pool still self-promotes; this at
+/// least keeps the Metal submit thread from matching the window's QoS.
+fn demote_worker_qos() {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        extern "C" {
+            fn pthread_set_qos_class_self_np(qos_class: u32, relative_priority: i32) -> i32;
+        }
+        const QOS_CLASS_UTILITY: u32 = 0x11;
+        pthread_set_qos_class_self_np(QOS_CLASS_UTILITY, 0);
+    }
 }
 
 fn requested_backend() -> String {
@@ -73,7 +216,7 @@ fn requested_backend() -> String {
         .to_ascii_lowercase()
 }
 
-fn load_recognizer() -> (OcrRecognizer, String) {
+fn load_recognizer() -> (OcrEngine, String) {
     let backend = requested_backend();
     match backend.as_str() {
         "vlm" | "hunyuan" | "hunyuanocr" | "paddle" | "paddleocr-vl" | "paddleocr_vl" => {
@@ -81,8 +224,8 @@ fn load_recognizer() -> (OcrRecognizer, String) {
         }
         "hat" | "ctc" => load_hat(),
         "" => {
-            // With the vlm feature, prefer the local VLM when its checkpoint
-            // is on disk so `cargo run --features vlm` is enough to try it.
+            // Hunyuan is the default app backend when the vlm feature is on
+            // and the checkpoint is on disk.
             #[cfg(feature = "vlm")]
             {
                 if vlm_model_dir().is_some() {
@@ -101,7 +244,7 @@ fn load_recognizer() -> (OcrRecognizer, String) {
     }
 }
 
-fn load_hat() -> (OcrRecognizer, String) {
+fn load_hat() -> (OcrEngine, String) {
     for path in checkpoint_candidates() {
         if !path.is_file() {
             continue;
@@ -109,7 +252,9 @@ fn load_hat() -> (OcrRecognizer, String) {
         match Recognizer::load(&path) {
             Ok(rec) => {
                 return (
-                    OcrRecognizer(OcrEngine::Hat(rec)),
+                    OcrEngine {
+                        inner: OcrBackend::Hat(rec),
+                    },
                     path.display().to_string(),
                 );
             }
@@ -125,20 +270,24 @@ fn load_hat() -> (OcrRecognizer, String) {
                 "ocr: embedded checkpoint incompatible with HAT ({err}); using random weights until a HAT checkpoint is trained"
             );
             return (
-                OcrRecognizer(OcrEngine::Hat(
-                    Recognizer::random().expect("failed to build random HAT recognizer"),
-                )),
+                OcrEngine {
+                    inner: OcrBackend::Hat(
+                        Recognizer::random().expect("failed to build random HAT recognizer"),
+                    ),
+                },
                 "random (HAT, no trained checkpoint yet)".to_string(),
             );
         }
     };
     (
-        OcrRecognizer(OcrEngine::Hat(rec)),
+        OcrEngine {
+            inner: OcrBackend::Hat(rec),
+        },
         "embedded checkpoints/model.mpk".to_string(),
     )
 }
 
-fn load_vlm_or_explain() -> (OcrRecognizer, String) {
+fn load_vlm_or_explain() -> (OcrEngine, String) {
     #[cfg(feature = "vlm")]
     {
         let Some(dir) = vlm_model_dir() else {
@@ -157,7 +306,12 @@ fn load_vlm_or_explain() -> (OcrRecognizer, String) {
         match crate::vlm::VlmOcr::load(&dir, device.trim()) {
             Ok(vlm) => {
                 let source = vlm.label(&dir, device.trim());
-                return (OcrRecognizer(OcrEngine::Vlm(vlm)), source);
+                return (
+                    OcrEngine {
+                        inner: OcrBackend::Vlm(vlm),
+                    },
+                    source,
+                );
             }
             Err(err) => panic!("failed to load HunyuanOCR from {}: {err}", dir.display()),
         }

@@ -25,31 +25,19 @@
 //! technique.
 //!
 //! ## The fusion tradeoff (read before touching Cargo.toml)
-//! A hand-written kernel needs a raw `CubeTensor` to launch against. But
-//! production `Wgpu` is `Fusion<CubeBackend<...>>` by default (burn-wgpu's
-//! own `default` feature list includes `fusion`) — under fusion, a
-//! `Tensor<Wgpu, _>`'s primitive is a `FusionTensor`, which defers and
-//! coalesces small composed ops rather than dispatching them immediately,
-//! and isn't something a downstream crate can unwrap into a `CubeTensor`
-//! without patching Burn itself (same category of problem as the
-//! `topological_sort` fix, i.e. not something to take on here). The
-//! workaround, applied in `hwr-model/Cargo.toml`: disable Burn's default
-//! features and explicitly re-enable only `["std", "wgpu", "autodiff"]` —
-//! no `"fusion"` — which makes `Wgpu` = bare `CubeBackend`, so
-//! `FloatTensor<Wgpu>` really is a `CubeTensor`.
+//! A hand-written kernel needs a raw `CubeTensor` to launch against. HAT's
+//! recognizer is composed Burn ops (transformer + conv) and *wants*
+//! burn-wgpu `fusion` (`FusionTensor` coalesces those launches). That is
+//! now the crate default again (`hwr-model/Cargo.toml`). This kernel is
+//! therefore not compiled (`lib.rs` leaves `mod fused_lstm_kernel` commented
+//! out). Uncomment it only if fusion is turned off and `Wgpu` is once more
+//! a bare `CubeBackend`.
 //!
-//! This is a real, non-free trade-off, empirically measured: composed
-//! tensor-op code (stock `BiLstm`, or any hot path *not* converted to a
-//! kernel) gets dramatically SLOWER without fusion (stock `BiLstm` at
-//! steps=320 went from ~1s to over 6 minutes) — fusion was doing real
-//! op-coalescing work elsewhere. It's a net win here specifically because
-//! *both* `lstm_seq_forward_cached` and `lstm_seq_backward` (this module)
-//! are now full kernels with nothing left in the LSTM's hot path relying on
-//! fusion. Everything else in `Recognizer` (`BatchNorm`, `Dropout`,
-//! `Linear`, `CTCLoss`) is either a single op or (for `CTCLoss`) already
-//! non-fuseable by Burn's own design — but this was validated by direct
-//! benchmark against the running corpus, not assumed; see the commit/PR
-//! history around when this module landed for that check.
+//! Empirically, composed tensor-op code (stock `BiLstm`, HAT's MHA/Conv
+//! stack) is dramatically faster *with* fusion (stock `BiLstm` at
+//! steps=320 went from over 6 minutes without fusion to ~1s with it).
+//! The LSTM cube was a net win only while the recognizer *was* that kernel
+//! and nothing else on the hot path relied on fusion.
 
 use burn::tensor::{Tensor, TensorMetadata, TensorPrimitive};
 use burn_cubecl::ops::numeric::empty_device_dtype;

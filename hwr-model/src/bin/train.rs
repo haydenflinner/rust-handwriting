@@ -55,7 +55,8 @@ fn main() {
     let mut peak_lr: Option<f64> = None;
     let mut warmup_steps = 100usize;
     let mut decay_steps = 2000usize;
-    let mut tcn_channels_override: Option<Option<usize>> = None;
+    // TCN off unless `--tcn` is added later. Same as `--no-tcn`.
+    let mut tcn_channels_override: Option<Option<usize>> = Some(None);
     let mut sources: Vec<PathBuf> = Vec::new();
 
     let mut args = std::env::args().skip(1);
@@ -172,13 +173,8 @@ fn main() {
         tcn_channels_override,
     };
     println!(
-        "Batch size: {batch_size}, max_grad_norm: {max_grad_norm}, optimizer: {}, tcn: {}",
+        "Batch size: {batch_size}, max_grad_norm: {max_grad_norm}, optimizer: {}, architecture: HAT",
         if use_sgd { "SGD+momentum" } else { "AdamW" },
-        match tcn_channels_override {
-            Some(None) => "disabled (--no-tcn)".to_string(),
-            Some(Some(c)) => format!("{c} channels (override)"),
-            None => format!("{:?} (default)", hwr_model::model::Config::default().tcn_channels),
-        }
     );
     if let Some(s) = &lr_schedule {
         println!(
@@ -212,16 +208,13 @@ fn main() {
         Some(path) => {
             let recorder =
                 burn::record::NamedMpkFileRecorder::<burn::record::FullPrecisionSettings>::new();
-            let mut baseline_model_config = hwr_model::model::Config::default();
-            if let Some(tcn_channels) = tcn_channels_override {
-                baseline_model_config.tcn_channels = tcn_channels;
-            }
+            let baseline_model_config = hwr_model::model::Config::default();
             let init_model = hwr_model::model::Recognizer::<hwr_model::Backend>::new(
                 baseline_model_config,
                 &device,
             )
             .load_file(path.to_path_buf(), &recorder, &device)
-            .expect("failed to load init checkpoint for baseline val CER — if this is a shape/key mismatch, the checkpoint was probably trained with a different --no-tcn setting than this run");
+            .expect("failed to load init checkpoint for baseline val CER — LSTM/TCN checkpoints cannot load into HAT");
             let baseline = hwr_model::eval::mean_cer(&init_model, val_pairs, &device);
             println!("Baseline val_cer from init checkpoint: {baseline:.4}");
             baseline
@@ -235,7 +228,8 @@ fn main() {
         train_pairs,
         &config,
         init_checkpoint.as_deref(),
-        |stats, net| {
+        None,
+        |stats, net, save_optim| {
             let val_cer = hwr_model::eval::mean_cer(net, val_pairs, &device);
             let train_cer = hwr_model::eval::mean_cer(net, &train_sample, &device);
             let improved = val_cer < best_val_cer;
@@ -251,11 +245,24 @@ fn main() {
                 stats.lr,
                 if improved { "  <- best so far, saving" } else { "" },
             );
+            // Layer / CTC-output snapshot on a fixed 16-sample slice of the
+            // train subsample. Cheap next to mean_cer, and the numbers the
+            // dashboard needs to tell blank-collapse apart from "emitting
+            // garbage" apart from "actually learning characters".
+            // Not on the training path: the extra forward + last-batch
+            // grad RMS were stalling epochs. `hwr_model::probe` is still
+            // there for a one-off look; loss/val_cer are enough while we
+            // just need more training.
             if improved {
                 best_val_cer = val_cer;
                 best_epoch = stats.epoch;
                 if let Err(e) = hwr_model::train::save(net, &checkpoint_out) {
                     eprintln!("failed to save checkpoint: {e}");
+                } else {
+                    let sidecar = hwr_model::train::optimizer_sidecar(&checkpoint_out);
+                    if let Err(e) = save_optim(&sidecar) {
+                        eprintln!("failed to save optimizer sidecar: {e}");
+                    }
                 }
             }
         },

@@ -6,7 +6,6 @@ use burn::module::Module;
 use burn::record::{
     FullPrecisionSettings, NamedMpkBytesRecorder, NamedMpkFileRecorder, Recorder, RecorderError,
 };
-use burn::tensor::{Tensor, TensorData};
 use hwr_ink::ink::Ink;
 
 use crate::decode::{self, ModelOutput};
@@ -72,40 +71,24 @@ impl Recognizer {
     }
 
     pub fn recognize<O: ModelOutput>(&self, ink: &Ink, decoder: &O) -> Result<O::Out, Error> {
-        let encoded = spline::encode_vec(ink);
-        let steps = encoded.len() / spline::WIDTH;
+        let encoded = spline::encode_strokes(ink);
+        let steps = encoded.len() / spline::STROKE_DIM;
 
         if steps == 0 {
             return Ok(decoder.read_from(&[]));
         }
 
-        // Replicate to batch=16: CubeCL's GPU autotuner for the TCN
-        // front-end's `Conv1d` (see `model.rs`) crashes hard at
-        // batch_size=1 — every candidate kernel implementation errors out
-        // ("Communication channel with the server is down"). Training's
-        // batch=16 never hit this, so single-sample inference is padded
-        // out to that exact, already-validated shape rather than a
-        // smaller untested one, and the (identical) extra rows are
-        // discarded afterward. Wastes ~16x compute for one recognition
-        // call, acceptable for a model this small run interactively.
-        const BATCH: usize = 16;
-        let mut batched = Vec::with_capacity(encoded.len() * BATCH);
-        for _ in 0..BATCH {
-            batched.extend_from_slice(&encoded);
-        }
-
-        let input = Tensor::<Backend, 3>::from_data(
-            TensorData::new(batched, [BATCH, steps, spline::WIDTH]),
-            &self.device,
-        );
-        let output = self.model.forward(input);
+        let (strokes, images, pad) =
+            spline::pack_hat_batch([(encoded.as_slice(), steps)], 1, 1, steps);
+        let (strokes, images, pad_mask) =
+            model::packed_inputs(strokes, images, pad, 1, steps, &self.device);
+        let output = self.model.forward(strokes, images, Some(pad_mask));
         let flat: Vec<f32> = output
             .into_data()
             .to_vec()
             .expect("f32 tensor data should convert to Vec<f32>");
 
-        let per_sample = flat.len() / BATCH;
-        Ok(decoder.read_from(&flat[..per_sample]))
+        Ok(decoder.read_from(&flat))
     }
 
     pub fn recognize_greedy(&self, ink: &Ink) -> Result<String, Error> {

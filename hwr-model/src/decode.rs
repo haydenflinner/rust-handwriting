@@ -19,7 +19,9 @@ pub fn classes() -> usize {
 /// character outside the trained alphabet.
 pub fn encode_labels(text: &str) -> Option<Vec<usize>> {
     let chars: Vec<char> = CHARS.chars().collect();
-    text.chars().map(|c| chars.iter().position(|&x| x == c)).collect()
+    text.chars()
+        .map(|c| chars.iter().position(|&x| x == c))
+        .collect()
 }
 
 pub trait ModelOutput {

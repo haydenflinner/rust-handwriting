@@ -53,13 +53,13 @@ echo "=== single continuous run started ($(date)) ===" >> "$LOG"
 if [ -f "$CKPT" ]; then
   ./target/release/train --out "$CKPT" --init "$CKPT" --epochs 100000 --lr 0.03 \
     --peak-lr 0.3 --warmup-steps 100 --decay-steps 2000 \
-    --batch-size 16 --max-steps 150 \
+    --batch-size 16 --max-steps 150 --no-tcn \
     armrest/data/inks "/Users/wow/Library/Application Support/hwr/calibration.txt" \
     >> "$LOG" 2>&1
 else
   ./target/release/train --out "$CKPT" --epochs 100000 --lr 0.03 \
     --peak-lr 0.3 --warmup-steps 100 --decay-steps 2000 \
-    --batch-size 16 --max-steps 150 \
+    --batch-size 16 --max-steps 150 --no-tcn \
     armrest/data/inks "/Users/wow/Library/Application Support/hwr/calibration.txt" \
     >> "$LOG" 2>&1
 fi

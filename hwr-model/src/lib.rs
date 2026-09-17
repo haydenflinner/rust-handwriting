@@ -3,8 +3,12 @@ pub mod corpus;
 pub mod decode;
 pub mod eval;
 pub mod fused_lstm;
-mod fused_lstm_kernel;
+// Not compiled: `fused_lstm_kernel.rs` launches against a raw CubeTensor.
+// HAT needs burn-wgpu `fusion` (`FusionTensor`), which that kernel cannot
+// unwrap. Source stays in-tree for a no-fusion LSTM revival.
+// mod fused_lstm_kernel;
 pub mod model;
+pub mod pbt;
 pub mod probe;
 pub mod recognizer;
 pub mod spline;

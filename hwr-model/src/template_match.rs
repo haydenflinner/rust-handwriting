@@ -41,11 +41,8 @@ fn normalize(ink: &Ink) -> Vec<(f32, f32)> {
     let total_len = ink.ink_len().max(1e-6);
     let step = total_len / (RESAMPLE_POINTS.saturating_sub(1)).max(1) as f32;
     let resampled_ink = ink.resample(step.max(1e-6));
-    let mut resampled: Vec<(f32, f32)> = resampled_ink
-        .points()
-        .iter()
-        .map(|p| (p.x, p.y))
-        .collect();
+    let mut resampled: Vec<(f32, f32)> =
+        resampled_ink.points().iter().map(|p| (p.x, p.y)).collect();
 
     if resampled.is_empty() {
         resampled.push((0.0, 0.0));

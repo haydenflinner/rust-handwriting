@@ -14,10 +14,9 @@
 //!   a timestep — can rise while blank still wins argmax, which is the
 //!   "it *is* learning character identity, blank just still outscores it"
 //!   signal that CER will never show.
-//! - Per-layer activation RMS: dying vs exploding hidden states through
-//!   the 5-layer BiLSTM stack.
+//! - Per-layer activation RMS through the HAT stack (stroke transformer, fusion).
 //! - Per-group weight / gradient RMS: are the weights actually moving, and
-//!   is gradient reaching the early layers or dying at `dense`?
+//!   is gradient reaching the early layers or dying at `classifier`?
 
 use std::collections::BTreeMap;
 use std::marker::PhantomData;
@@ -25,11 +24,10 @@ use std::marker::PhantomData;
 use burn::module::{Module, ModuleVisitor, Param};
 use burn::optim::GradientsParams;
 use burn::tensor::activation::softmax;
-use burn::tensor::backend::Backend;
-use burn::tensor::{Tensor, TensorData};
+use burn::tensor::backend::{AutodiffBackend, Backend};
+use burn::tensor::{ElementConversion, Tensor};
 use hwr_ink::ink::Ink;
 
-use crate::fused_lstm::FusedLstm;
 use crate::{decode, eval, model, spline};
 
 /// One named activation tensor from [`model::Recognizer::forward_traced`].
@@ -112,7 +110,7 @@ impl ProbeReport {
 /// layer / output / weight diagnostics. Pads the batch to `SAFE_BATCH`
 /// (repeating the last row) for the same CubeCL autotune reason as
 /// [`eval::mean_cer`].
-pub fn probe<B: FusedLstm>(
+pub fn probe<B: Backend>(
     net: &model::Recognizer<B>,
     pairs: &[(String, Ink)],
     device: &B::Device,
@@ -128,18 +126,11 @@ pub fn probe<B: FusedLstm>(
     }
 
     let batch = eval::SAFE_BATCH;
-    let mut input_buf = vec![0f32; batch * max_steps * spline::WIDTH];
-    for bi in 0..batch {
-        let sample = &prepared[bi.min(n_real - 1)];
-        let dst = bi * max_steps * spline::WIDTH;
-        let len = sample.steps * spline::WIDTH;
-        input_buf[dst..dst + len].copy_from_slice(&sample.encoded[..len]);
-    }
-    let input = Tensor::<B, 3>::from_data(
-        TensorData::new(input_buf, [batch, max_steps, spline::WIDTH]),
-        device,
-    );
-    let (logits, traces) = net.forward_traced(input);
+    let rows = prepared.iter().map(|s| (s.encoded.as_slice(), s.steps));
+    let (strokes, images, pad) = spline::pack_hat_batch(rows, n_real, batch, max_steps);
+    let (strokes, images, pad_mask) =
+        model::packed_inputs(strokes, images, pad, batch, max_steps, device);
+    let (logits, traces) = net.forward_traced(strokes, images, Some(pad_mask));
     let layers: Vec<LayerAct> = traces
         .into_iter()
         .map(|(name, t)| {
@@ -180,15 +171,33 @@ pub fn probe<B: FusedLstm>(
 /// [`grouped_weight_rms`] (`lstm0`..`lstmN`, `dense`, optional `tcn*`).
 /// Intended for the last successful batch of an epoch — pulling every
 /// gradient tensor back to the CPU every step would dominate epoch time.
-pub fn grouped_grad_rms<B: Backend, M: Module<B>>(
+///
+/// `GradientsParams::from_grads` registers each tensor as `B::InnerBackend`
+/// (the Wgpu tensor, not the Autodiff wrapper). Looking them up as `B`
+/// finds the id but fails Burn's `TensorContainer` downcast — which is a
+/// panic, not `None` — and aborts the epoch before `on_epoch` can log.
+pub fn grouped_grad_rms<B: AutodiffBackend, M: Module<B>>(
     module: &M,
     grads: &GradientsParams,
 ) -> Vec<(String, f32)> {
-    grouped_rms(module, Some(grads))
+    let mut visitor = GradRms::<B> {
+        path: Vec::new(),
+        groups: BTreeMap::new(),
+        grads,
+        _b: PhantomData,
+    };
+    module.visit(&mut visitor);
+    finish_groups(visitor.groups)
 }
 
 pub fn grouped_weight_rms<B: Backend, M: Module<B>>(module: &M) -> Vec<(String, f32)> {
-    grouped_rms(module, None)
+    let mut visitor = GroupRms {
+        path: Vec::new(),
+        groups: BTreeMap::new(),
+        _b: PhantomData,
+    };
+    module.visit(&mut visitor);
+    finish_groups(visitor.groups)
 }
 
 struct ProbeSample {
@@ -203,8 +212,8 @@ fn prepare_probe_samples(pairs: &[(String, Ink)]) -> Vec<ProbeSample> {
         if out.len() >= eval::SAFE_BATCH {
             break;
         }
-        let encoded = spline::encode_vec(ink);
-        let steps = encoded.len() / spline::WIDTH;
+        let encoded = spline::encode_strokes(ink);
+        let steps = encoded.len() / spline::STROKE_DIM;
         if steps == 0 {
             continue;
         }
@@ -218,8 +227,8 @@ fn prepare_probe_samples(pairs: &[(String, Ink)]) -> Vec<ProbeSample> {
 }
 
 fn mean_std_rms<B: Backend, const D: usize>(t: Tensor<B, D>) -> (f32, f32, f32) {
-    let mean: f32 = t.clone().mean().into_scalar();
-    let mean_sq: f32 = t.powf_scalar(2.0).mean().into_scalar();
+    let mean: f32 = t.clone().mean().into_scalar().elem();
+    let mean_sq: f32 = t.powf_scalar(2.0).mean().into_scalar().elem();
     let var = (mean_sq - mean * mean).max(0.0);
     (mean, var.sqrt(), mean_sq.max(0.0).sqrt())
 }
@@ -310,14 +319,13 @@ pub(crate) fn summarize_probs(
     }
 }
 
-struct GroupRms<'a, B: Backend> {
+struct GroupRms<B: Backend> {
     path: Vec<String>,
     groups: BTreeMap<String, (f64, usize)>,
-    grads: Option<&'a GradientsParams>,
     _b: PhantomData<B>,
 }
 
-impl<B: Backend> ModuleVisitor<B> for GroupRms<'_, B> {
+impl<B: Backend> ModuleVisitor<B> for GroupRms<B> {
     fn enter_module(&mut self, name: &str, _container_type: &str) {
         self.path.push(name.to_string());
     }
@@ -330,34 +338,51 @@ impl<B: Backend> ModuleVisitor<B> for GroupRms<'_, B> {
         let Some(group) = group_name(&self.path) else {
             return;
         };
-        let t = match self.grads {
-            Some(grads) => match grads.get::<B, D>(param.id) {
-                Some(g) => g,
-                None => return,
-            },
-            None => param.val(),
-        };
-        let n = t.shape().num_elements();
-        let ss: f32 = t.powf_scalar(2.0).sum().into_scalar();
-        let entry = self.groups.entry(group).or_insert((0.0, 0));
-        entry.0 += ss as f64;
-        entry.1 += n;
+        accumulate_rms(&mut self.groups, group, param.val());
     }
 }
 
-fn grouped_rms<B: Backend, M: Module<B>>(
-    module: &M,
-    grads: Option<&GradientsParams>,
-) -> Vec<(String, f32)> {
-    let mut visitor = GroupRms {
-        path: Vec::new(),
-        groups: BTreeMap::new(),
-        grads,
-        _b: PhantomData,
-    };
-    module.visit(&mut visitor);
-    let mut out: Vec<(String, f32)> = visitor
-        .groups
+struct GradRms<'a, B: AutodiffBackend> {
+    path: Vec<String>,
+    groups: BTreeMap<String, (f64, usize)>,
+    grads: &'a GradientsParams,
+    _b: PhantomData<B>,
+}
+
+impl<B: AutodiffBackend> ModuleVisitor<B> for GradRms<'_, B> {
+    fn enter_module(&mut self, name: &str, _container_type: &str) {
+        self.path.push(name.to_string());
+    }
+
+    fn exit_module(&mut self, _name: &str, _container_type: &str) {
+        self.path.pop();
+    }
+
+    fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+        let Some(group) = group_name(&self.path) else {
+            return;
+        };
+        let Some(g) = self.grads.get::<B::InnerBackend, D>(param.id) else {
+            return;
+        };
+        accumulate_rms(&mut self.groups, group, g);
+    }
+}
+
+fn accumulate_rms<B: Backend, const D: usize>(
+    groups: &mut BTreeMap<String, (f64, usize)>,
+    group: String,
+    t: Tensor<B, D>,
+) {
+    let n = t.shape().num_elements();
+    let ss: f32 = t.powf_scalar(2.0).sum().into_scalar().elem();
+    let entry = groups.entry(group).or_insert((0.0, 0));
+    entry.0 += ss as f64;
+    entry.1 += n;
+}
+
+fn finish_groups(groups: BTreeMap<String, (f64, usize)>) -> Vec<(String, f32)> {
+    let mut out: Vec<(String, f32)> = groups
         .into_iter()
         .filter(|(_, (_, n))| *n > 0)
         .map(|(name, (ss, n))| (name, (ss / n as f64).sqrt() as f32))
@@ -368,25 +393,28 @@ fn grouped_rms<B: Backend, M: Module<B>>(
 
 fn group_name(path: &[String]) -> Option<String> {
     match path.first().map(String::as_str) {
-        Some("tcn") => Some(format!("tcn{}", path.get(1).map(|s| s.as_str()).unwrap_or("0"))),
-        Some("layers") => Some(format!(
-            "lstm{}",
+        Some("img_convs") => Some(format!(
+            "img{}",
             path.get(1).map(|s| s.as_str()).unwrap_or("0")
         )),
-        Some("dense") => Some("dense".to_string()),
+        Some("stroke_encoder") => Some("stroke_tf".to_string()),
+        Some("pen_embed") | Some("stroke_proj") | Some("stroke_bn") => Some("stroke_in".to_string()),
+        Some("cross_mha") | Some("cross_tf") => Some("fusion".to_string()),
+        Some("latent_mha") | Some("latent_tf") | Some("latents") => Some("latents".to_string()),
+        Some("classifier") => Some("classifier".to_string()),
         _ => None,
     }
 }
 
 fn group_sort_key(name: &str) -> (u8, u8) {
-    if let Some(rest) = name.strip_prefix("tcn") {
-        (0, rest.parse().unwrap_or(0))
-    } else if let Some(rest) = name.strip_prefix("lstm") {
-        (1, rest.parse().unwrap_or(0))
-    } else if name == "dense" {
-        (2, 0)
-    } else {
-        (3, 0)
+    match name {
+        n if n.starts_with("img") => (0, n.trim_start_matches("img").parse().unwrap_or(0)),
+        "stroke_in" => (1, 0),
+        "stroke_tf" => (1, 1),
+        "latents" => (2, 0),
+        "fusion" => (3, 0),
+        "classifier" => (4, 0),
+        _ => (5, 0),
     }
 }
 

@@ -62,6 +62,38 @@ pub fn load_source(path: &Path, pairs: &mut Vec<(String, Ink)>) {
     }
 }
 
+/// Load each source, apply [`cap_long_samples`], and optionally truncate
+/// *per source* after a seeded shuffle. Use `per_source_cap` when mixing a
+/// huge corpus (MNIST digits) with a smaller one (glyph words) so the
+/// concat-then-truncate path cannot drown the small source. The final
+/// concatenation is shuffled with seed 1234, matching `bin/train.rs`.
+pub fn load_sources_capped(
+    sources: &[impl AsRef<Path>],
+    max_steps: usize,
+    per_source_cap: Option<usize>,
+) -> Vec<(String, Ink)> {
+    use rand::rngs::StdRng;
+    use rand::seq::SliceRandom;
+    use rand::SeedableRng;
+
+    let mut pairs = Vec::new();
+    for (i, source) in sources.iter().enumerate() {
+        let mut one = Vec::new();
+        load_source(source.as_ref(), &mut one);
+        one = cap_long_samples(one, max_steps);
+        if let Some(cap) = per_source_cap {
+            let mut rng = StdRng::seed_from_u64(1234 + i as u64);
+            one.shuffle(&mut rng);
+            one.truncate(cap);
+            one.shrink_to_fit();
+        }
+        pairs.extend(one);
+    }
+    let mut rng = StdRng::seed_from_u64(1234);
+    pairs.shuffle(&mut rng);
+    pairs
+}
+
 /// Write `(text, ink)` pairs in the same `text\tink` format `load_pairs`
 /// reads, one per line.
 pub fn save_pairs(path: impl AsRef<Path>, pairs: &[(String, Ink)]) -> io::Result<()> {

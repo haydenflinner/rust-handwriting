@@ -31,7 +31,10 @@ const UPPERCASE: &[&str] = &[
 
 pub fn pages() -> Vec<Page> {
     let categories: &[(&str, &[&str])] = &[
-        ("Digits", &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]),
+        (
+            "Digits",
+            &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"],
+        ),
         ("Lowercase Letters", LOWERCASE),
         ("Uppercase Letters", UPPERCASE),
         (

@@ -36,12 +36,12 @@ while true; do
   echo "=== restart $i ($(date)) ===" >> "$LOG"
   if [ -f "$CKPT" ]; then
     ./target/release/train --out "$CKPT" --init "$CKPT" --epochs 50 --lr 0.1 \
-      --batch-size 16 --max-steps 150 \
+      --batch-size 16 --max-steps 150 --no-tcn \
       armrest/data/inks "/Users/wow/Library/Application Support/hwr/calibration.txt" \
       >> "$LOG" 2>&1
   else
     ./target/release/train --out "$CKPT" --epochs 50 --lr 0.1 \
-      --batch-size 16 --max-steps 150 \
+      --batch-size 16 --max-steps 150 --no-tcn \
       armrest/data/inks "/Users/wow/Library/Application Support/hwr/calibration.txt" \
       >> "$LOG" 2>&1
   fi

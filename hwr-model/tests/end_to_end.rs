@@ -20,7 +20,7 @@ fn random_model_runs_end_to_end() {
     let ink = sample_ink();
 
     // With random weights the text is meaningless, but the whole pipeline —
-    // spline encoding, the 5-layer BiLSTM stack, dense+softmax, CTC greedy
+    // HAT stroke+image encode, fused transformer, dense+softmax, CTC greedy
     // decode — must run without shape errors and produce *some* string.
     let text = recognizer
         .recognize_greedy(&ink)

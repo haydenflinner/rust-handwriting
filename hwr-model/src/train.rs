@@ -14,7 +14,7 @@
 //! `CTCLoss` takes explicit `input_lengths`/`target_lengths` tensors and
 //! only ever computes over each sample's real (unpadded) extent.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::backend::wgpu::WgpuDevice;
 use burn::module::{AutodiffModule, Module};
@@ -22,7 +22,7 @@ use burn::nn::loss::{CTCLossConfig, Reduction};
 use burn::optim::grad_clipping::GradientClippingConfig;
 use burn::optim::momentum::MomentumConfig;
 use burn::optim::{AdamWConfig, GradientsParams, Optimizer, SgdConfig};
-use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder};
+use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
 use burn::tensor::activation::log_softmax;
 use burn::tensor::{Int, Tensor, TensorData};
 use rand::seq::SliceRandom;
@@ -40,6 +40,10 @@ pub struct TrainConfig {
     /// clip the candle version used). armrest's own training pipeline
     /// (`script/training.py`) used 9.0 for the same architecture.
     pub max_grad_norm: f32,
+    /// Samples per GPU launch. 16 was the long-standing CubeCL-safe size
+    /// (TCN `Conv1d` used to crash at batch=1). No-TCN fused LSTM was
+    /// smoke-tested through 256; 128 raises cube count without turning a
+    /// short PBT stretch into a handful of giant steps.
     pub batch_size: usize,
     /// AdamW (the default) adapts each parameter's effective step size from
     /// its own gradient history, which converges faster in the common case
@@ -63,16 +67,8 @@ pub struct TrainConfig {
     /// backstops any batch that still goes bad regardless). `None` keeps
     /// the old flat-`learning_rate`-for-the-whole-run behavior.
     pub lr_schedule: Option<LrSchedule>,
-    /// Overrides `model::Config::default()`'s `tcn_channels` for this run.
-    /// `train()` previously always used `model::Config::default()`
-    /// unconditionally, which meant the TCN front-end (see `model.rs`) —
-    /// including its dilation=1 compromise, forced by a CubeCL crash on
-    /// dilation>1 rather than the standard growing-dilation TCN recipe —
-    /// was baked into every training run with no way to turn it off and
-    /// compare against the proven no-front-end architecture (armrest's own
-    /// `training.py`, the reference paper). `None` here means "use
-    /// `model::Config::default()`'s value" (currently `Some(32)`, i.e. TCN
-    /// on); pass `Some(None)` explicitly to disable the TCN front-end.
+    /// Unused by HAT (no TCN). Kept so existing `--no-tcn` CLI / PBT
+    /// flags still parse; the field is ignored at model-build time.
     pub tcn_channels_override: Option<Option<usize>>,
 }
 
@@ -108,7 +104,7 @@ impl Default for TrainConfig {
             epochs: 10,
             learning_rate: 1e-3,
             max_grad_norm: 9.0,
-            batch_size: 16,
+            batch_size: 128,
             use_sgd: false,
             lr_schedule: None,
             tcn_channels_override: None,
@@ -124,6 +120,10 @@ pub struct EpochStats {
     /// The LR in effect at the end of this epoch — mainly so a schedule's
     /// progress is visible in logs/dashboards, not just inferred from loss.
     pub lr: f64,
+    /// Per-group gradient RMS from the last successful batch of this epoch
+    /// (`lstm0`..`lstmN`, `dense`, optional `tcn*`). Empty if every batch
+    /// was skipped. See `crate::probe` for the grouping.
+    pub grad_rms: Vec<(String, f32)>,
 }
 
 /// A pre-encoded, pre-validated training example: spline-encoded ink plus
@@ -132,7 +132,7 @@ pub struct EpochStats {
 /// every epoch.
 struct Sample {
     labels: Vec<usize>,
-    encoded: Vec<f32>, // flat [steps * spline::WIDTH]
+    encoded: Vec<f32>, // flat [steps * spline::STROKE_DIM]
     steps: usize,
 }
 
@@ -149,8 +149,8 @@ fn prepare_samples(pairs: &[(String, Ink)]) -> (Vec<Sample>, usize) {
             skipped += 1;
             continue;
         }
-        let encoded = spline::encode_vec(ink);
-        let steps = encoded.len() / spline::WIDTH;
+        let encoded = spline::encode_strokes(ink);
+        let steps = encoded.len() / spline::STROKE_DIM;
         let ext_len = 2 * labels.len() + 1;
         if steps == 0 || steps < ext_len {
             skipped += 1;
@@ -165,30 +165,112 @@ fn prepare_samples(pairs: &[(String, Ink)]) -> (Vec<Sample>, usize) {
     (samples, skipped)
 }
 
+/// Sidecar path for optimizer moments next to a model checkpoint
+/// (`foo.mpk` → `foo.optim.mpk`). AdamW first/second moments and SGD
+/// momentum live here so a PBT stretch / `train_loop` restart does not
+/// throw them away.
+pub fn optimizer_sidecar(model_ckpt: impl AsRef<Path>) -> PathBuf {
+    model_ckpt.as_ref().with_extension("optim.mpk")
+}
+
+fn optimizer_kind_path(optim_path: &Path) -> PathBuf {
+    optim_path.with_extension("kind")
+}
+
+/// Copy `{from}.optim.mpk` (+ kind) onto `{to}`'s sidecar, or delete the
+/// destination sidecar if the source has none.
+pub fn copy_optimizer_sidecar(from_model: &Path, to_model: &Path) -> Result<(), String> {
+    let src = optimizer_sidecar(from_model);
+    let dst = optimizer_sidecar(to_model);
+    if !src.exists() {
+        clear_optimizer_sidecar(to_model);
+        return Ok(());
+    }
+    std::fs::copy(&src, &dst).map_err(|e| e.to_string())?;
+    let ksrc = optimizer_kind_path(&src);
+    let kdst = optimizer_kind_path(&dst);
+    if ksrc.exists() {
+        std::fs::copy(&ksrc, &kdst).map_err(|e| e.to_string())?;
+    }
+    Ok(())
+}
+
+pub fn clear_optimizer_sidecar(model_ckpt: &Path) {
+    let p = optimizer_sidecar(model_ckpt);
+    let _ = std::fs::remove_file(&p);
+    let _ = std::fs::remove_file(optimizer_kind_path(&p));
+}
+
+fn save_optimizer<O>(optimizer: &O, path: &Path, use_sgd: bool) -> Result<(), String>
+where
+    O: Optimizer<model::Recognizer<TrainBackend>, TrainBackend>,
+{
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    recorder
+        .record(optimizer.to_record(), path.to_path_buf())
+        .map_err(|e| e.to_string())?;
+    let kind = if use_sgd { "sgd" } else { "adamw" };
+    std::fs::write(optimizer_kind_path(path), kind).map_err(|e| e.to_string())
+}
+
+fn load_optimizer<O>(optimizer: O, path: &Path, use_sgd: bool, device: &WgpuDevice) -> O
+where
+    O: Optimizer<model::Recognizer<TrainBackend>, TrainBackend>,
+{
+    if !path.exists() {
+        return optimizer;
+    }
+    let want = if use_sgd { "sgd" } else { "adamw" };
+    let got = std::fs::read_to_string(optimizer_kind_path(path)).unwrap_or_default();
+    if got.trim() != want {
+        eprintln!(
+            "warning: skipping {} (kind '{}' vs {want})",
+            path.display(),
+            got.trim()
+        );
+        return optimizer;
+    }
+    let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+    match recorder.load(path.to_path_buf(), device) {
+        Ok(record) => optimizer.load_record(record),
+        Err(e) => {
+            eprintln!("warning: failed to load optimizer {}: {e}", path.display());
+            optimizer
+        }
+    }
+}
+
 /// Train a model on `pairs`, starting from `init_checkpoint`'s weights if
 /// given (fine-tuning) or from a fresh random init otherwise. Calls
 /// `on_epoch` after each epoch (e.g. for logging/checkpointing) with an
-/// inference-ready (dropout-disabled) copy of the model; returns the final
-/// trained model, also inference-ready.
+/// inference-ready (dropout-disabled) copy of the model and a `save_optim`
+/// callback so the caller can persist AdamW/SGD moments next to the
+/// weights they keep. `init_optim` reloads those moments when present and
+/// the kind (adamw vs sgd) matches this run. Returns the final trained
+/// model, also inference-ready.
 pub fn train(
     pairs: &[(String, Ink)],
     config: &TrainConfig,
     init_checkpoint: Option<&Path>,
-    mut on_epoch: impl FnMut(&EpochStats, &model::Recognizer<Backend>),
+    init_optim: Option<&Path>,
+    mut on_epoch: impl FnMut(
+        &EpochStats,
+        &model::Recognizer<Backend>,
+        &mut dyn FnMut(&Path) -> Result<(), String>,
+    ),
 ) -> model::Recognizer<Backend> {
     let device = Default::default();
-    let mut model_config = model::Config::default();
-    if let Some(tcn_channels) = config.tcn_channels_override {
-        model_config.tcn_channels = tcn_channels;
-    }
-    let mut model: model::Recognizer<TrainBackend> =
-        model::Recognizer::new(model_config, &device);
+    let model_config = model::Config::default();
+    let mut model: model::Recognizer<TrainBackend> = model::Recognizer::new(model_config, &device);
 
     if let Some(path) = init_checkpoint {
         let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
-        model = model
-            .load_file(path.to_path_buf(), &recorder, &device)
-            .expect("failed to load init checkpoint");
+        model = model.load_file(path.to_path_buf(), &recorder, &device).unwrap_or_else(|e| {
+            panic!(
+                "failed to load init checkpoint {}: {e} — HAT weights are a different layout than the old BiLSTM/TCN checkpoints",
+                path.display()
+            );
+        });
     }
 
     let blank = decode::classes() - 1;
@@ -240,16 +322,36 @@ pub fn train(
             .with_momentum(Some(MomentumConfig::new().with_momentum(0.9)))
             .with_gradient_clipping(Some(GradientClippingConfig::Norm(config.max_grad_norm)))
             .init();
+        if let Some(path) = init_optim {
+            optimizer = load_optimizer(optimizer, path, true, &device);
+        }
         model = run_epochs(
-            model, &mut optimizer, &ctc, &samples, &batches, config, pairs, &device,
+            model,
+            &mut optimizer,
+            &ctc,
+            &samples,
+            &batches,
+            config,
+            pairs,
+            &device,
             &mut on_epoch,
         );
     } else {
         let mut optimizer = AdamWConfig::new()
             .with_grad_clipping(Some(GradientClippingConfig::Norm(config.max_grad_norm)))
             .init();
+        if let Some(path) = init_optim {
+            optimizer = load_optimizer(optimizer, path, false, &device);
+        }
         model = run_epochs(
-            model, &mut optimizer, &ctc, &samples, &batches, config, pairs, &device,
+            model,
+            &mut optimizer,
+            &ctc,
+            &samples,
+            &batches,
+            config,
+            pairs,
+            &device,
             &mut on_epoch,
         );
     }
@@ -270,7 +372,11 @@ fn run_epochs<O>(
     config: &TrainConfig,
     pairs: &[(String, Ink)],
     device: &WgpuDevice,
-    on_epoch: &mut impl FnMut(&EpochStats, &model::Recognizer<Backend>),
+    on_epoch: &mut impl FnMut(
+        &EpochStats,
+        &model::Recognizer<Backend>,
+        &mut dyn FnMut(&Path) -> Result<(), String>,
+    ),
 ) -> model::Recognizer<TrainBackend>
 where
     O: Optimizer<model::Recognizer<TrainBackend>, TrainBackend>,
@@ -285,18 +391,40 @@ where
     for epoch in 0..config.epochs {
         let mut total_loss = 0.0f64;
         let mut trained = 0usize;
+        let mut last_grad_rms: Vec<(String, f32)> = Vec::new();
 
         let mut batch_order: Vec<usize> = (0..batches.len()).collect();
         batch_order.shuffle(&mut rng);
 
-        for &bi in &batch_order {
+        for (_step_i, &bi) in batch_order.iter().enumerate() {
             current_lr = lr_at_step(global_step, config.learning_rate, &config.lr_schedule);
             let batch: Vec<&Sample> = batches[bi].iter().map(|&i| &samples[i]).collect();
-            let (updated_model, loss_val, valid) =
-                train_batch_step(model, optimizer, current_lr, ctc, &batch, device);
+            // Gradient RMS requires a GPU->CPU read of every parameter
+            // tensor; do it only on the last batch of the epoch so the
+            // dashboard can plot layer-wise gradient flow without paying
+            // that cost on every step.
+            // Left off: that sync was aborting/slowing every epoch (Burn
+            // stores grads as inner-backend tensors; looking them up as
+            // Autodiff panicked, and even the successful path is a full
+            // param round-trip). Re-enable with
+            // `capture_grads = step_i + 1 == batch_order.len()` if the
+            // dashboard grads chart is needed again.
+            let capture_grads = false;
+            let (updated_model, loss_val, valid, grad_rms) = train_batch_step(
+                model,
+                optimizer,
+                current_lr,
+                ctc,
+                &batch,
+                device,
+                capture_grads,
+            );
             model = updated_model;
             total_loss += loss_val as f64;
             trained += valid;
+            if !grad_rms.is_empty() {
+                last_grad_rms = grad_rms;
+            }
             global_step += 1;
         }
 
@@ -310,16 +438,21 @@ where
             samples: trained,
             skipped: pairs.len() - trained,
             lr: current_lr,
+            grad_rms: last_grad_rms,
         };
         let inference_model = model.valid();
-        on_epoch(&stats, &inference_model);
+        let use_sgd = config.use_sgd;
+        let mut save_optim = |path: &Path| save_optimizer(optimizer, path, use_sgd);
+        on_epoch(&stats, &inference_model, &mut save_optim);
     }
 
     model
 }
 
 /// Run one training step on a batch of samples (already bucketed by the
-/// caller). Returns `(updated model, summed loss, batch size)`.
+/// caller). Returns `(updated model, summed loss, batch size, grad_rms)`.
+/// `grad_rms` is only populated when `capture_grads` is set — see the
+/// call in `run_epochs`.
 fn train_batch_step<O>(
     model: model::Recognizer<TrainBackend>,
     optimizer: &mut O,
@@ -327,7 +460,13 @@ fn train_batch_step<O>(
     ctc: &burn::nn::loss::CTCLoss,
     batch: &[&Sample],
     device: &WgpuDevice,
-) -> (model::Recognizer<TrainBackend>, f32, usize)
+    capture_grads: bool,
+) -> (
+    model::Recognizer<TrainBackend>,
+    f32,
+    usize,
+    Vec<(String, f32)>,
+)
 where
     O: Optimizer<model::Recognizer<TrainBackend>, TrainBackend>,
 {
@@ -335,20 +474,15 @@ where
     let max_steps = batch.iter().map(|s| s.steps).max().unwrap_or(0);
     let max_target_len = batch.iter().map(|s| s.labels.len()).max().unwrap_or(0);
     if max_steps == 0 || max_target_len == 0 {
-        return (model, 0.0, 0);
+        return (model, 0.0, 0, Vec::new());
     }
 
-    let mut input_buf = vec![0f32; b * max_steps * spline::WIDTH];
     let mut target_buf = vec![0i32; b * max_target_len];
     let mut input_lengths = vec![0i32; b];
     let mut target_lengths = vec![0i32; b];
 
     for (bi, sample) in batch.iter().enumerate() {
-        let dst = bi * max_steps * spline::WIDTH;
-        let len = sample.steps * spline::WIDTH;
-        input_buf[dst..dst + len].copy_from_slice(&sample.encoded[..len]);
         input_lengths[bi] = sample.steps as i32;
-
         let tdst = bi * max_target_len;
         for (j, &label) in sample.labels.iter().enumerate() {
             target_buf[tdst + j] = label as i32;
@@ -356,11 +490,11 @@ where
         target_lengths[bi] = sample.labels.len() as i32;
     }
 
-    let input = Tensor::<TrainBackend, 3>::from_data(
-        TensorData::new(input_buf, [b, max_steps, spline::WIDTH]),
-        device,
-    );
-    let logits = model.forward_logits(input); // [B, max_steps, classes]
+    let rows = batch.iter().map(|s| (s.encoded.as_slice(), s.steps));
+    let (strokes, images, pad) = spline::pack_hat_batch(rows, b, b, max_steps);
+    let (strokes, images, pad_mask) =
+        model::packed_inputs(strokes, images, pad, b, max_steps, device);
+    let logits = model.forward_logits(strokes, images, Some(pad_mask)); // [B, max_steps, classes]
 
     // Burn's CTCLoss wants log-probabilities shaped [time, batch, classes].
     let log_probs = log_softmax(logits, 2).swap_dims(0, 1);
@@ -369,17 +503,18 @@ where
         TensorData::new(target_buf, [b, max_target_len]),
         device,
     );
-    let input_lengths = Tensor::<TrainBackend, 1, Int>::from_data(
-        TensorData::new(input_lengths, [b]),
-        device,
-    );
-    let target_lengths = Tensor::<TrainBackend, 1, Int>::from_data(
-        TensorData::new(target_lengths, [b]),
-        device,
-    );
+    let input_lengths =
+        Tensor::<TrainBackend, 1, Int>::from_data(TensorData::new(input_lengths, [b]), device);
+    let target_lengths =
+        Tensor::<TrainBackend, 1, Int>::from_data(TensorData::new(target_lengths, [b]), device);
 
-    let loss =
-        ctc.forward_with_reduction(log_probs, targets, input_lengths, target_lengths, Reduction::Mean);
+    let loss = ctc.forward_with_reduction(
+        log_probs,
+        targets,
+        input_lengths,
+        target_lengths,
+        Reduction::Mean,
+    );
     let loss_val: f32 = loss
         .clone()
         .into_data()
@@ -398,14 +533,19 @@ where
     // unattended run.
     if !loss_val.is_finite() {
         eprintln!("warning: skipping batch with non-finite loss ({loss_val})");
-        return (model, 0.0, 0);
+        return (model, 0.0, 0, Vec::new());
     }
 
     let grads = loss.backward();
     let grads = GradientsParams::from_grads(grads, &model);
+    let grad_rms = if capture_grads {
+        crate::probe::grouped_grad_rms(&model, &grads)
+    } else {
+        Vec::new()
+    };
     let model = optimizer.step(lr, model, grads);
 
-    (model, loss_val, b)
+    (model, loss_val, b, grad_rms)
 }
 
 /// Save a checkpoint in Burn's Named-MessagePack format.

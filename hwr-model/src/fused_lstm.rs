@@ -21,12 +21,12 @@
 //! original candle port, since analytic BPTT gradients are exactly the
 //! kind of thing that's easy to get subtly wrong.
 
-use burn::backend::Autodiff;
-use burn::backend::autodiff::NodeId;
 use burn::backend::autodiff::checkpoint::base::Checkpointer;
 use burn::backend::autodiff::checkpoint::strategy::CheckpointStrategy;
 use burn::backend::autodiff::grads::Gradients;
 use burn::backend::autodiff::ops::{Backward, Ops, OpsKind};
+use burn::backend::autodiff::NodeId;
+use burn::backend::Autodiff;
 use burn::module::{Module, Param};
 use burn::tensor::activation::sigmoid;
 use burn::tensor::backend::Backend;
@@ -218,11 +218,14 @@ pub fn lstm_backward<B: Backend>(
 /// `B` from within `Autodiff<B, C>`'s own custom `Backward` wiring below,
 /// never on `Autodiff<B, C>` itself, so there'd be nothing meaningful for
 /// `Autodiff` to implement here. `NdArray` (test-only, see `Cargo.toml`)
-/// uses the portable composed-tensor-ops functions below; `Wgpu`
-/// (production) uses the fused CubeCL kernel in `fused_lstm_kernel.rs` —
-/// see that module's docs for why a hand-written kernel needs its own
-/// implementation rather than being generic over `Backend` the way
-/// `lstm_forward`/`lstm_backward` are.
+/// and production `Wgpu` both use the portable composed-tensor-ops functions
+/// below (`lstm_forward` / `lstm_backward`). The CubeCL kernel in
+/// `fused_lstm_kernel.rs` needs a raw `CubeTensor`; with burn-wgpu `fusion`
+/// on (HAT's composed transformer/conv path), `Wgpu` tensors are
+/// `FusionTensor`s and that kernel cannot launch. Fusion is the right
+/// tradeoff for HAT: it coalesces the many small MHA/Conv ops that used
+/// to be slow with fusion off.
+
 pub trait FusedLstmKernel: Backend {
     fn lstm_seq_forward_cached(
         x: Tensor<Self, 3>,
@@ -329,56 +332,11 @@ macro_rules! impl_fused_lstm_plain {
 #[cfg(test)]
 impl_fused_lstm_plain!(burn::backend::NdArray);
 
-impl FusedLstmKernel for burn::backend::Wgpu {
-    fn lstm_seq_forward_cached(
-        x: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        b_ih: Tensor<Self, 1>,
-        b_hh: Tensor<Self, 1>,
-        hidden_size: usize,
-    ) -> (Tensor<Self, 3>, LstmCache<Self>) {
-        crate::fused_lstm_kernel::kernel_forward(x, w_ih, w_hh, b_ih, b_hh, hidden_size)
-    }
-
-    fn lstm_seq_backward(
-        grad_h_seq: Tensor<Self, 3>,
-        x: Tensor<Self, 3>,
-        w_ih: Tensor<Self, 2>,
-        w_hh: Tensor<Self, 2>,
-        cache: &LstmCache<Self>,
-        hidden_size: usize,
-    ) -> (
-        Tensor<Self, 3>,
-        Tensor<Self, 2>,
-        Tensor<Self, 2>,
-        Tensor<Self, 1>,
-        Tensor<Self, 1>,
-    ) {
-        crate::fused_lstm_kernel::kernel_backward(grad_h_seq, x, w_ih, w_hh, cache, hidden_size)
-    }
-}
-
-impl FusedLstm for burn::backend::Wgpu {
-    fn lstm_seq(
-        x: FloatTensor<Self>,
-        w_ih: FloatTensor<Self>,
-        w_hh: FloatTensor<Self>,
-        b_ih: FloatTensor<Self>,
-        b_hh: FloatTensor<Self>,
-        hidden_size: usize,
-    ) -> FloatTensor<Self> {
-        let (h_seq, _cache) = crate::fused_lstm_kernel::kernel_forward(
-            wrap(x),
-            wrap(w_ih),
-            wrap(w_hh),
-            wrap(b_ih),
-            wrap(b_hh),
-            hidden_size,
-        );
-        unwrap(h_seq)
-    }
-}
+// Production Wgpu: same composed-tensor-ops path so burn-wgpu `fusion`
+// can coalesce the LSTM ops. The CubeCL kernel in `fused_lstm_kernel.rs`
+// is not compiled (see `lib.rs`) because fusion wraps tensors as
+// `FusionTensor`s, which that kernel cannot unwrap.
+impl_fused_lstm_plain!(burn::backend::Wgpu);
 
 impl<B: FusedLstmKernel, C: CheckpointStrategy> FusedLstm for Autodiff<B, C> {
     fn lstm_seq(
@@ -550,7 +508,14 @@ pub fn fused_bilstm_seq<B: FusedLstm>(
     b_hh_rev: Tensor<B, 1>,
     hidden_size: usize,
 ) -> Tensor<B, 3> {
-    let fwd = fused_lstm_seq(x.clone(), w_ih_fwd, w_hh_fwd, b_ih_fwd, b_hh_fwd, hidden_size);
+    let fwd = fused_lstm_seq(
+        x.clone(),
+        w_ih_fwd,
+        w_hh_fwd,
+        b_ih_fwd,
+        b_hh_fwd,
+        hidden_size,
+    );
     let rev_out = fused_lstm_seq(
         x.flip([1]),
         w_ih_rev,
@@ -591,7 +556,8 @@ impl<B: Backend> FusedBiLstmLayer<B> {
     pub fn new(input_size: usize, hidden_size: usize, device: &B::Device) -> Self {
         let k = 1.0 / (hidden_size as f64).sqrt();
         let dist = Distribution::Uniform(-k, k);
-        let w2 = |r: usize, c: usize| Param::from_tensor(Tensor::<B, 2>::random([r, c], dist, device));
+        let w2 =
+            |r: usize, c: usize| Param::from_tensor(Tensor::<B, 2>::random([r, c], dist, device));
         let w1 = |n: usize| Param::from_tensor(Tensor::<B, 1>::random([n], dist, device));
 
         FusedBiLstmLayer {
@@ -679,16 +645,25 @@ mod tests {
             TensorData::new(p.w_hh.clone(), [4 * HIDDEN, HIDDEN]),
             device,
         );
-        let b_ih =
-            Tensor::<CpuBackend, 1>::from_data(TensorData::new(p.b_ih.clone(), [4 * HIDDEN]), device);
-        let b_hh =
-            Tensor::<CpuBackend, 1>::from_data(TensorData::new(p.b_hh.clone(), [4 * HIDDEN]), device);
+        let b_ih = Tensor::<CpuBackend, 1>::from_data(
+            TensorData::new(p.b_ih.clone(), [4 * HIDDEN]),
+            device,
+        );
+        let b_hh = Tensor::<CpuBackend, 1>::from_data(
+            TensorData::new(p.b_hh.clone(), [4 * HIDDEN]),
+            device,
+        );
 
         let (h_seq, _) = lstm_forward(x, w_ih, w_hh, b_ih, b_hh, HIDDEN);
         h_seq.sum().into_scalar()
     }
 
-    fn numerical_grad(p: &Params, field: &str, idx: usize, device: &burn::backend::ndarray::NdArrayDevice) -> f32 {
+    fn numerical_grad(
+        p: &Params,
+        field: &str,
+        idx: usize,
+        device: &burn::backend::ndarray::NdArrayDevice,
+    ) -> f32 {
         let eps = 1e-3f32;
         let mut plus = Params {
             x: p.x.clone(),
@@ -750,7 +725,14 @@ mod tests {
             &device,
         );
 
-        let (h_seq, cache) = lstm_forward(x.clone(), w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh.clone(), HIDDEN);
+        let (h_seq, cache) = lstm_forward(
+            x.clone(),
+            w_ih.clone(),
+            w_hh.clone(),
+            b_ih.clone(),
+            b_hh.clone(),
+            HIDDEN,
+        );
         let grad_h_seq = Tensor::<CpuBackend, 3>::ones([BATCH, STEPS, HIDDEN], &device);
         let (grad_x, grad_w_ih, grad_w_hh, grad_b_ih, grad_b_hh) =
             lstm_backward(grad_h_seq, x, w_ih, w_hh, &cache, HIDDEN);
@@ -785,7 +767,10 @@ mod tests {
                 checked += 1;
             }
         }
-        assert!(checked >= 15, "sanity: should have checked a good number of elements");
+        assert!(
+            checked >= 15,
+            "sanity: should have checked a good number of elements"
+        );
     }
 
     /// Validates the `Backward`/`Ops`/checkpointing wiring itself (not just
@@ -826,7 +811,14 @@ mod tests {
 
         // Direct path: same as the finite-difference test above.
         let (x, w_ih, w_hh, b_ih, b_hh) = mk(&p, &device);
-        let (h_seq, cache) = lstm_forward(x.clone(), w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh.clone(), HIDDEN);
+        let (h_seq, cache) = lstm_forward(
+            x.clone(),
+            w_ih.clone(),
+            w_hh.clone(),
+            b_ih.clone(),
+            b_hh.clone(),
+            HIDDEN,
+        );
         let grad_h_seq = Tensor::<CpuBackend, 3>::ones([BATCH, STEPS, HIDDEN], &device);
         let (_, direct_grad_w_ih, direct_grad_w_hh, direct_grad_b_ih, _) =
             lstm_backward(grad_h_seq, x, w_ih, w_hh, &cache, HIDDEN);
@@ -840,12 +832,18 @@ mod tests {
         let b_ih = Tensor::<CpuAd, 1>::from_data(b_ih.into_data(), &device).require_grad();
         let b_hh = Tensor::<CpuAd, 1>::from_data(b_hh.into_data(), &device).require_grad();
 
-        let out = fused_lstm_seq::<CpuAd>(x, w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh, HIDDEN);
+        let out =
+            fused_lstm_seq::<CpuAd>(x, w_ih.clone(), w_hh.clone(), b_ih.clone(), b_hh, HIDDEN);
         let mut grads = out.sum().backward();
 
         let ad_grad_w_ih: Vec<f32> = w_ih.grad(&grads).unwrap().into_data().to_vec().unwrap();
         let ad_grad_w_hh: Vec<f32> = w_hh.grad(&grads).unwrap().into_data().to_vec().unwrap();
-        let ad_grad_b_ih: Vec<f32> = b_ih.grad_remove(&mut grads).unwrap().into_data().to_vec().unwrap();
+        let ad_grad_b_ih: Vec<f32> = b_ih
+            .grad_remove(&mut grads)
+            .unwrap()
+            .into_data()
+            .to_vec()
+            .unwrap();
 
         let direct_grad_w_ih: Vec<f32> = direct_grad_w_ih.into_data().to_vec().unwrap();
         let direct_grad_w_hh: Vec<f32> = direct_grad_w_hh.into_data().to_vec().unwrap();

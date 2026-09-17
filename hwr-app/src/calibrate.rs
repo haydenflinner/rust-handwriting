@@ -229,7 +229,12 @@ fn save_page_button(parent: &mut ChildSpawnerCommands) {
                     if !cell.ink.is_empty() {
                         append_sample(&log.0, &prompt.0, &cell.ink);
                         cell.saved_count += 1;
-                        update_count_label(children, &children_q, &mut count_texts, cell.saved_count);
+                        update_count_label(
+                            children,
+                            &children_q,
+                            &mut count_texts,
+                            cell.saved_count,
+                        );
                     }
                     cell.clear();
                 }

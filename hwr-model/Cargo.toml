@@ -4,14 +4,12 @@ version = "0.1.0"
 edition.workspace = true
 
 [dependencies]
-# `default-features = false` + explicit feature list (no "fusion") is
-# required, not optional: the fused CubeCL LSTM kernel (fused_lstm_kernel.rs)
-# needs a raw `CubeTensor` to launch against, but with fusion on (burn-wgpu's
-# own default), `Wgpu`'s `FloatTensor` is a `FusionTensor` instead — fusion
-# wraps small composed tensor ops for op-coalescing, which is exactly what a
-# hand-written kernel doesn't need and can't accept. See fused_lstm_kernel.rs
-# module docs for the empirically-measured tradeoff this implies elsewhere.
-burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff"] }
+# HAT (transformer + conv) is composed Burn ops. burn-wgpu `fusion`
+# coalesces those into fewer GPU launches — we measured stock composed
+# paths ~hundreds of times faster with it on. The custom CubeCL LSTM
+# kernel needed fusion *off* (raw `CubeTensor`, not `FusionTensor`); that
+# kernel is no longer on the recognizer path, so fusion is back on.
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff", "fusion"] }
 burn-cubecl = { version = "0.21.0", features = ["fusion"] }
 cubecl = { version = "0.10.0", features = ["wgpu"] }
 cgmath = "0.18"
@@ -36,9 +34,7 @@ rustuna_sampler = { path = "../third_party/rustuna_sampler" }
 #
 # `default-features = false` here too (mirroring `[dependencies]`) is load
 # -bearing, not cosmetic: Cargo unifies features across `[dependencies]` and
-# `[dev-dependencies]` for the same crate when building tests, so an entry
-# here that left default features on would silently re-enable "fusion" (via
-# burn-wgpu's own default feature list) for every test build, breaking the
-# fused CubeCL kernel's raw-CubeTensor requirement — this is exactly what
-# happened the first time this was written without it.
+# `[dev-dependencies]` for the same crate when building tests. NdArray
+# tests do not need wgpu/fusion; leaving defaults on would still pull
+# burn-wgpu's default feature list into lib tests.
 burn = { version = "0.21.0", default-features = false, features = ["std", "ndarray"] }

@@ -255,9 +255,8 @@ fn rebuild_grid_on_page_change(
             text.0 = "No data found".to_string();
         }
         for mut text in &mut progress_labels {
-            text.0 =
-                "No calibration.txt yet, and armrest/data/inks/ isn't visible from here."
-                    .to_string();
+            text.0 = "No calibration.txt yet, and armrest/data/inks/ isn't visible from here."
+                .to_string();
         }
         commands.entity(grid_entity).despawn_children();
         return;
@@ -336,7 +335,12 @@ fn fit_transform(ink: &Ink, target_center: Vec2, target_size: Vec2) -> impl Fn(f
 }
 
 fn draw_review_cells(
-    cells: Query<(&ReviewCell, &ComputedNode, &UiGlobalTransform, &InheritedVisibility)>,
+    cells: Query<(
+        &ReviewCell,
+        &ComputedNode,
+        &UiGlobalTransform,
+        &InheritedVisibility,
+    )>,
     windows: Query<&Window, With<PrimaryWindow>>,
     mut gizmos: Gizmos,
 ) {

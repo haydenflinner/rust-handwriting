@@ -32,6 +32,8 @@
 //! run. A short per-trial budget is a real tradeoff: a combination that
 //! only pays off after 60+ epochs will look no better than one that
 //! plateaus immediately. Treat the winner as a promising lead, not a proof.
+//! For *continuous* adaptation while training (copy weights from better
+//! replicas, mutate their HPs, keep going), see `bin/pbt.rs`.
 //!
 //! `--init` is optional: without it, every trial trains from a fresh
 //! random init instead of fine-tuning a shared checkpoint — necessary when
@@ -125,7 +127,7 @@ fn run_one_trial(
         epochs: budget_epochs,
         learning_rate,
         max_grad_norm: TrainConfig::default().max_grad_norm,
-        batch_size: 16,
+        batch_size: TrainConfig::default().batch_size,
         use_sgd,
         lr_schedule: None,
         // Not searched here: every trial shares one `--init` checkpoint,
@@ -135,12 +137,14 @@ fn run_one_trial(
         // shape. The TCN-vs-no-TCN question is a separate, from-scratch
         // ablation (see train.rs's --no-tcn flag), not part of this
         // fine-tune-from-a-checkpoint LR/optimizer search.
-        tcn_channels_override: None,
+        // Explicit no-TCN: Config default is already None, but pass
+        // `Some(None)` so a future default-on cannot silently re-enable it.
+        tcn_channels_override: Some(None),
     };
 
     let device = Default::default();
     let mut best_val_cer = f64::INFINITY;
-    let _ = train(train_pairs, &config, init_checkpoint, |stats, net| {
+    let _ = train(train_pairs, &config, init_checkpoint, None, |stats, net, _save_optim| {
         let val_cer = hwr_model::eval::mean_cer(net, val_pairs, &device);
         if val_cer < best_val_cer {
             best_val_cer = val_cer;

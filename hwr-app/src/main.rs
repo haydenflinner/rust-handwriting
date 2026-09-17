@@ -1,10 +1,14 @@
 mod calibrate;
+#[cfg(feature = "vlm")]
+mod ink_image;
 mod mode;
 mod ocr;
 mod prompts;
 mod review;
 mod storage;
 mod test_mode;
+#[cfg(feature = "vlm")]
+mod vlm;
 mod writing_cell;
 
 use bevy::prelude::*;

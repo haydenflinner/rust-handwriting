@@ -12,6 +12,9 @@ target/
 /lstm-ctc-ocr/
 /MathWriting-human/
 /paddle-ocr-rs/
+/oar-ocr/
+/Crane/
+/xybrid/
 /rustuna/
 /sefaz-webservices-postman/
 /synthetic_handwriting.py
@@ -24,6 +27,9 @@ target/
 # dashboard — reproducible from source + a training run, not source
 # themselves. `dashboard.html` matches the *.html rule above too.
 /checkpoints/
+
+# Local VLM checkpoints (PaddleOCR-VL etc.), downloaded separately.
+/models/
 
 # Generated training corpora (augmented/synthetic data, MNIST-as-vectors) —
 # large, regenerable via `augment`/`synth_glyphs`/whatever produced the

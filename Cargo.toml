@@ -5,10 +5,13 @@ members = [
     "hwr-model",
     "hwr-app",
 ]
-# paddle-ocr-rs is a separate reference project (its own git repo), not part
-# of this workspace — exclude it so cargo doesn't try to fold it in.
+# Reference checkouts (their own git repos), not part of this workspace —
+# exclude them so cargo doesn't try to fold them in.
 exclude = [
     "paddle-ocr-rs",
+    "oar-ocr",
+    "Crane",
+    "xybrid",
 ]
 
 [workspace.package]

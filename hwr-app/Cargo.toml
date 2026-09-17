@@ -3,11 +3,19 @@ name = "hwr-app"
 version = "0.1.0"
 edition.workspace = true
 
+[features]
+default = []
+# Local VLM OCR via oar-ocr-vl + HunyuanOCR. Off by default so a
+# normal `cargo run -p hwr-app` still only builds the HAT recognizer.
+vlm = ["dep:oar-ocr-vl", "dep:image"]
+
 [dependencies]
 bevy = "0.19.1"
 dirs = "7.0.0"
 hwr-ink = { path = "../hwr-ink" }
 hwr-model = { path = "../hwr-model" }
+image = { version = "0.25", optional = true }
+oar-ocr-vl = { path = "../oar-ocr/oar-ocr-vl", optional = true, default-features = false, features = ["metal"] }
 
 [[bin]]
 name = "hwr-app"

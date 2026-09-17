@@ -1,5 +1,6 @@
 mod calibrate;
 mod gpu_gate;
+mod hunyuan_tasks;
 #[cfg(feature = "vlm")]
 mod ink_image;
 mod mode;

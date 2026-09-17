@@ -39,16 +39,29 @@ enum OcrBackend {
     Vlm(crate::vlm::VlmOcr),
 }
 
+struct OcrJob {
+    id: u64,
+    ink: Ink,
+    prompt: Option<String>,
+}
+
 impl OcrEngine {
-    fn recognize(&self, ink: &Ink, writing: &AtomicBool, gpu: &GpuGate) -> Result<String, String> {
+    fn recognize(
+        &self,
+        ink: &Ink,
+        writing: &AtomicBool,
+        gpu: &GpuGate,
+        prompt: Option<&str>,
+    ) -> Result<String, String> {
         match &self.inner {
             OcrBackend::Hat(rec) => {
+                let _ = prompt;
                 gpu.ocr_acquire(writing);
                 let _hold = gpu.ocr_hold();
                 rec.recognize_greedy(ink).map_err(|err| err.to_string())
             }
             #[cfg(feature = "vlm")]
-            OcrBackend::Vlm(vlm) => vlm.recognize(ink, writing, gpu),
+            OcrBackend::Vlm(vlm) => vlm.recognize(ink, writing, gpu, prompt),
         }
     }
 
@@ -64,7 +77,7 @@ impl OcrEngine {
 /// Main-thread handle to the OCR worker. `NonSend` because `mpsc::Receiver`
 /// isn't `Sync`; we only poll it from the Bevy main thread anyway.
 pub struct OcrClient {
-    req_tx: Sender<(u64, Ink)>,
+    req_tx: Sender<OcrJob>,
     res_rx: Receiver<(u64, Result<String, String>)>,
     next_id: u64,
     inflight: Option<u64>,
@@ -76,29 +89,29 @@ impl OcrClient {
         self.is_vlm
     }
 
-    pub fn submit(&mut self, ink: Ink) {
+    pub fn submit(&mut self, ink: Ink, prompt: Option<String>) -> u64 {
         self.next_id += 1;
         let id = self.next_id;
         self.inflight = Some(id);
-        if self.req_tx.send((id, ink)).is_err() {
+        if self.req_tx.send(OcrJob { id, ink, prompt }).is_err() {
             eprintln!("ocr: worker thread is gone");
             self.inflight = None;
         }
+        id
     }
 
-    /// Apply a completed job if it is still the latest submit. Stale results
-    /// (superseded strokes, or a clear while inference was running) are dropped.
-    pub fn poll(&mut self) -> Option<Result<String, String>> {
-        loop {
-            match self.res_rx.try_recv() {
-                Ok((id, result)) => {
-                    if self.inflight == Some(id) {
-                        self.inflight = None;
-                        return Some(result);
-                    }
+    /// Next finished job. `current` is true when this is still the latest
+    /// submit (not cancelled and not superseded).
+    pub fn poll(&mut self) -> Option<(u64, bool, Result<String, String>)> {
+        match self.res_rx.try_recv() {
+            Ok((id, result)) => {
+                let current = self.inflight == Some(id);
+                if current {
+                    self.inflight = None;
                 }
-                Err(_) => return None,
+                Some((id, current, result))
             }
+            Err(_) => None,
         }
     }
 
@@ -135,7 +148,7 @@ impl Plugin for OcrPlugin {
 }
 
 fn setup_recognizer(world: &mut World) {
-    let (req_tx, req_rx) = mpsc::channel::<(u64, Ink)>();
+    let (req_tx, req_rx) = mpsc::channel::<OcrJob>();
     let (res_tx, res_rx) = mpsc::channel::<(u64, Result<String, String>)>();
     let (ready_tx, ready_rx) = mpsc::sync_channel::<(String, bool)>(1);
     let writing = world.resource::<UiPointerDown>().0.clone();
@@ -172,24 +185,25 @@ fn setup_recognizer(world: &mut World) {
 
 fn ocr_worker(
     engine: OcrEngine,
-    req_rx: Receiver<(u64, Ink)>,
+    req_rx: Receiver<OcrJob>,
     res_tx: Sender<(u64, Result<String, String>)>,
     writing: Arc<AtomicBool>,
     gpu: GpuGate,
 ) {
     loop {
-        let (mut id, mut ink) = match req_rx.recv() {
+        let mut job = match req_rx.recv() {
             Ok(job) => job,
             Err(_) => break,
         };
-        // Keep only the newest queued stroke so a word written while a
-        // previous Hunyuan call is still running doesn't back up.
-        while let Ok((next_id, next_ink)) = req_rx.try_recv() {
-            id = next_id;
-            ink = next_ink;
+        // Keep only the newest queued job so a word written while a
+        // previous Hunyuan call is still running doesn't back up. Prompt
+        // switches while a call is in-flight still complete (already
+        // dequeued); only jobs still sitting in the channel are dropped.
+        while let Ok(next) = req_rx.try_recv() {
+            job = next;
         }
-        let result = engine.recognize(&ink, &writing, &gpu);
-        if res_tx.send((id, result)).is_err() {
+        let result = engine.recognize(&job.ink, &writing, &gpu, job.prompt.as_deref());
+        if res_tx.send((job.id, result)).is_err() {
             break;
         }
     }

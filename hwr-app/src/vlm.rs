@@ -9,60 +9,27 @@ use oar_ocr_vl::utils::parse_device;
 use oar_ocr_vl::HunyuanOcr;
 
 use crate::gpu_gate::{wait_while_writing, GpuGate};
+use crate::hunyuan_tasks;
 use crate::ink_image::rasterize_ink_rgb;
 
-/// Official HunyuanOCR-1.5 task prompts (Chinese). Tencent's client only
-/// exposes `--task-type`; they recommend the Chinese wording for quality.
-/// Override with `HWR_VL_TASK` (key below) or `HWR_VL_PROMPT` (raw string).
-///
-/// `structured_parse` is the general-scene OCR line (street view / ink).
-/// `formula` is the one that should turn a 2×2 matrix into LaTeX.
-fn official_task_prompt(task: &str) -> Option<&'static str> {
-    Some(match task {
-        "doc_parse" => {
-            "提取文档图片中正文的所有信息用markdown格式表示，其中页眉、页脚部分忽略，表格用html格式表达，文档中公式用latex格式表示，按照阅读顺序组织进行解析。"
+/// `HWR_VL_PROMPT` wins; otherwise the official Chinese string for
+/// `HWR_VL_TASK` (default `structured_parse`). Test mode passes an override
+/// from the task dropdown so switching tasks does not require a restart.
+fn hunyuan_instruction(override_prompt: Option<&str>) -> String {
+    if let Some(prompt) = override_prompt {
+        let trimmed = prompt.trim();
+        if !trimmed.is_empty() {
+            return trimmed.to_string();
         }
-        "structured_parse" => "提取图中的文字。",
-        "spotting_json" => {
-            "检测并识别图中所有的文字行，请按从上到下、从左到右的阅读顺序进行识别。 输出格式为 JSON 数组，每个元素必须包含：\"box\": [xmin, ymin, xmax, ymax]（坐标需归一化到 [0, 1000] 范围内）；\"text\": \"识别出的文字内容\"。 注意：请直接输出 JSON 数组，不要包含任何多余的描述性文字。"
-        }
-        "spotting_hunyuan" => "检测并识别图片中的文字，将文本坐标格式化输出。",
-        "layout" => "按照阅读顺序解析图中的版式信息。",
-        "layout_parse" => {
-            "提取文档图片中所有内容用markdown格式表示，表格用html格式表达，文档中公式用latex格式表示，请按照阅读顺序组织进行全文解析，并输出版式分析信息。"
-        }
-        "chart_parse" => {
-            "解析图中的图表，对于流程图使用Mermaid格式表示，其他图表使用Markdown格式表示。"
-        }
-        "formula" => "识别图片中的公式，用LaTeX格式表示。",
-        "table" => "把图中的表格解析为HTML。",
-        "doc_trans_en2zh" => {
-            "先解析文档，再将文档内容翻译为中文，其中页眉、页脚忽略，公式用latex格式表示，表格用html格式表示。"
-        }
-        "trans_other2en" => {
-            "按照阅读顺序，提取图中文字，公式用latex格式表示，表格用markdown格式表示，再将文字内容翻译为英文。"
-        }
-        "trans_other2zh" => {
-            "按照阅读顺序，提取图中文字，公式用latex格式表示，表格用markdown格式表示，再将文字内容翻译为中文。"
-        }
-        _ => return None,
-    })
-}
-
-fn hunyuan_instruction() -> String {
+    }
     if let Ok(raw) = std::env::var("HWR_VL_PROMPT") {
         let trimmed = raw.trim();
         if !trimmed.is_empty() {
             return trimmed.to_string();
         }
     }
-    let task = std::env::var("HWR_VL_TASK").unwrap_or_else(|_| "structured_parse".to_string());
-    let task = task.trim().to_ascii_lowercase();
-    official_task_prompt(&task)
-        .unwrap_or_else(|| {
-            eprintln!("ocr: unknown HWR_VL_TASK={task:?}; using structured_parse");
-            official_task_prompt("structured_parse").expect("structured_parse is a known task")
-        })
+    hunyuan_tasks::prompt_for(hunyuan_tasks::initial_task_id())
+        .expect("default Hunyuan task has a prompt")
         .to_string()
 }
 
@@ -132,6 +99,7 @@ impl VlmOcr {
         ink: &Ink,
         writing: &AtomicBool,
         gpu: &GpuGate,
+        prompt: Option<&str>,
     ) -> Result<String, String> {
         wait_while_writing(writing);
         let Some(image) = rasterize_ink_rgb(ink) else {
@@ -147,7 +115,7 @@ impl VlmOcr {
                 }
             }
         }
-        let prompt = hunyuan_instruction();
+        let prompt = hunyuan_instruction(prompt);
         let start = Instant::now();
         gpu.ocr_acquire(writing);
         let _hold = gpu.ocr_hold();
@@ -169,7 +137,7 @@ impl VlmOcr {
             .map_err(|err| err.to_string())?;
         let text = text.trim().to_string();
         eprintln!(
-            "ocr: HunyuanOCR inferred in {:.1}s → {text:?}",
+            "ocr: HunyuanOCR inferred in {:.1}s prompt={prompt:?} → {text:?}",
             start.elapsed().as_secs_f32()
         );
         Ok(text)

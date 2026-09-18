@@ -1,0 +1,226 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1, user-scalable=no" />
+    <title>HunyuanOCR</title>
+    <style>
+      :root {
+        --bg: #14141a;
+        --panel: rgba(12, 12, 18, 0.94);
+        --ink: #e8e8ee;
+        --muted: rgba(255, 255, 255, 0.55);
+        --line: rgba(255, 255, 255, 0.12);
+        --latex: #73b8fa;
+        --typst: #f5b85a;
+      }
+      * { box-sizing: border-box; }
+      html, body {
+        margin: 0;
+        height: 100%;
+        background: var(--bg);
+        color: #fff;
+        font: 14px/1.4 system-ui, sans-serif;
+        overflow: hidden;
+      }
+      canvas {
+        display: block;
+        width: 100%;
+        height: 100%;
+        touch-action: none;
+        cursor: crosshair;
+      }
+      #panel {
+        position: absolute;
+        top: 12px;
+        right: 12px;
+        width: min(360px, calc(100vw - 24px));
+        max-height: calc(100vh - 24px);
+        overflow: auto;
+        padding: 12px;
+        border: 1px solid var(--line);
+        border-radius: 12px;
+        background: var(--panel);
+      }
+      select, button {
+        font: inherit;
+        color: #fff;
+        background: rgba(255, 255, 255, 0.12);
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        padding: 8px 10px;
+      }
+      select { width: 100%; }
+      button { cursor: pointer; }
+      button:hover { background: rgba(255, 255, 255, 0.2); }
+      #status { color: var(--muted); margin: 8px 0 12px; font-size: 12px; }
+      .card { margin-top: 10px; }
+      .card h2 {
+        margin: 0 0 6px;
+        font-size: 12px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+      .latex h2 { color: var(--latex); }
+      .typst h2 { color: var(--typst); }
+      pre {
+        margin: 0;
+        min-height: 3em;
+        padding: 8px;
+        white-space: pre-wrap;
+        word-break: break-word;
+        background: rgba(0, 0, 0, 0.35);
+        border-radius: 8px;
+      }
+      .row { display: flex; gap: 8px; margin-top: 8px; }
+      .row button { flex: 1; }
+    </style>
+  </head>
+  <body>
+    <canvas id="c"></canvas>
+    <div id="panel">
+      <select id="task"></select>
+      <div id="status">Loading HunyuanOCR…</div>
+      <div class="row">
+        <button id="clear" type="button">Clear</button>
+        <button id="copy-latex" type="button">Copy LaTeX</button>
+        <button id="copy-typst" type="button">Copy Typst</button>
+      </div>
+      <div class="card latex">
+        <h2>LaTeX / text</h2>
+        <pre id="latex"></pre>
+      </div>
+      <div class="card typst">
+        <h2>Typst</h2>
+        <pre id="typst"></pre>
+      </div>
+    </div>
+    <script>
+      const canvas = document.getElementById("c");
+      const ctx = canvas.getContext("2d");
+      const taskEl = document.getElementById("task");
+      const statusEl = document.getElementById("status");
+      const latexEl = document.getElementById("latex");
+      const typstEl = document.getElementById("typst");
+      const strokes = [];
+      let current = null;
+      let start = 0;
+      let debounce = null;
+      let reqId = 0;
+
+      function resize() {
+        const dpr = Math.max(1, window.devicePixelRatio || 1);
+        canvas.width = Math.floor(window.innerWidth * dpr);
+        canvas.height = Math.floor(window.innerHeight * dpr);
+        ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+        redraw();
+      }
+      function redraw() {
+        ctx.fillStyle = "#14141a";
+        ctx.fillRect(0, 0, canvas.width, canvas.height);
+        ctx.lineCap = "round";
+        ctx.lineJoin = "round";
+        ctx.strokeStyle = "#e8e8ee";
+        ctx.lineWidth = 2.5;
+        for (const stroke of strokes) {
+          if (!stroke.length) continue;
+          ctx.beginPath();
+          ctx.moveTo(stroke[0].x, stroke[0].y);
+          for (let i = 1; i < stroke.length; i++) ctx.lineTo(stroke[i].x, stroke[i].y);
+          ctx.stroke();
+        }
+      }
+      function pos(ev) {
+        const r = canvas.getBoundingClientRect();
+        return { x: ev.clientX - r.left, y: ev.clientY - r.top, t: (performance.now() - start) / 1000 };
+      }
+      function schedule() {
+        clearTimeout(debounce);
+        debounce = setTimeout(recognize, 1000);
+      }
+      async function recognize() {
+        if (!strokes.length) return;
+        const id = ++reqId;
+        statusEl.textContent = "Recognizing…";
+        try {
+          const res = await fetch("/recognize", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({ task: taskEl.value, strokes }),
+          });
+          const data = await res.json();
+          if (id !== reqId) return;
+          if (!res.ok) throw new Error(data.error || res.statusText);
+          latexEl.textContent = data.text || "";
+          typstEl.textContent = data.typst || "";
+          statusEl.textContent = data.ms != null ? `HunyuanOCR · ${data.ms} ms` : "HunyuanOCR";
+        } catch (err) {
+          if (id !== reqId) return;
+          statusEl.textContent = String(err.message || err);
+        }
+      }
+      canvas.addEventListener("pointerdown", (ev) => {
+        if (ev.button !== undefined && ev.button !== 0) return;
+        canvas.setPointerCapture(ev.pointerId);
+        start = current ? start : performance.now();
+        current = [pos(ev)];
+        strokes.push(current);
+        redraw();
+      });
+      canvas.addEventListener("pointermove", (ev) => {
+        if (!current) return;
+        current.push(pos(ev));
+        redraw();
+      });
+      function endStroke() {
+        if (!current) return;
+        current = null;
+        schedule();
+      }
+      canvas.addEventListener("pointerup", endStroke);
+      canvas.addEventListener("pointercancel", endStroke);
+      document.getElementById("clear").onclick = () => {
+        strokes.length = 0;
+        current = null;
+        reqId += 1;
+        latexEl.textContent = "";
+        typstEl.textContent = "";
+        statusEl.textContent = "Cleared";
+        redraw();
+      };
+      function copy(el) {
+        const text = el.textContent || "";
+        if (!text) return;
+        navigator.clipboard.writeText(text);
+      }
+      document.getElementById("copy-latex").onclick = () => copy(latexEl);
+      document.getElementById("copy-typst").onclick = () => copy(typstEl);
+      window.addEventListener("keydown", (ev) => {
+        if (ev.key === "Escape" || ev.key === " ") {
+          ev.preventDefault();
+          document.getElementById("clear").click();
+        }
+      });
+      window.addEventListener("resize", resize);
+      resize();
+      fetch("/tasks")
+        .then((r) => r.json())
+        .then((data) => {
+          for (const task of data.tasks || []) {
+            const opt = document.createElement("option");
+            opt.value = task.id;
+            opt.textContent = `${task.id} — ${task.blurb}`;
+            if (task.id === data.default) opt.selected = true;
+            taskEl.appendChild(opt);
+          }
+          statusEl.textContent = "Write, then wait a beat for HunyuanOCR";
+        })
+        .catch((err) => {
+          statusEl.textContent = String(err);
+        });
+      taskEl.addEventListener("change", () => {
+        if (strokes.length) recognize();
+      });
+    </script>
+  </body>
+</html>

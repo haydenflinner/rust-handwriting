@@ -7,8 +7,9 @@
 //!
 //! Hunyuan and Bevy share one Metal GPU, so they take turns via a GPU token.
 
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(any(not(target_arch = "wasm32"), feature = "vlm"))]
+use std::path::PathBuf;
 #[cfg(not(target_arch = "wasm32"))]
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::Arc;
@@ -90,7 +91,7 @@ pub struct OcrClient {
     #[cfg(not(target_arch = "wasm32"))]
     res_rx: Receiver<(u64, Result<String, String>)>,
     #[cfg(target_arch = "wasm32")]
-    engine: OcrEngine,
+    engine: Option<OcrEngine>,
     #[cfg(target_arch = "wasm32")]
     pending: Option<OcrJob>,
     #[cfg(target_arch = "wasm32")]
@@ -142,9 +143,12 @@ impl OcrClient {
         #[cfg(target_arch = "wasm32")]
         {
             let job = self.pending.take()?;
+            let Some(engine) = self.engine.as_ref() else {
+                self.pending = Some(job);
+                return None;
+            };
             let result =
-                self.engine
-                    .recognize(&job.ink, &self.writing, &self.gpu, job.prompt.as_deref());
+                engine.recognize(&job.ink, &self.writing, &self.gpu, job.prompt.as_deref());
             let current = self.inflight == Some(job.id);
             if current {
                 self.inflight = None;
@@ -186,6 +190,8 @@ impl Plugin for OcrPlugin {
         app.insert_resource(UiPointerDown(Arc::new(AtomicBool::new(false))));
         // PreStartup so test-mode UI can read `OcrCheckpointSource` on Startup.
         app.add_systems(PreStartup, setup_recognizer);
+        #[cfg(target_arch = "wasm32")]
+        app.add_systems(Update, finish_wasm_ocr_load);
     }
 }
 
@@ -195,23 +201,20 @@ fn setup_recognizer(world: &mut World) {
 
     #[cfg(target_arch = "wasm32")]
     {
-        let fetched = world
-            .remove_resource::<WasmCheckpoint>()
-            .and_then(|ckpt| ckpt.0);
-        gpu.ocr_acquire(&writing);
-        let (engine, source) = load_recognizer(fetched.as_deref());
-        gpu.ocr_release();
-        let is_vlm = engine.is_vlm();
-        crate::log(&format!("ocr: loaded {source}"));
-        world.insert_resource(OcrCheckpointSource(source));
+        // Don't build the HAT weights before the winit event loop has
+        // resized the canvas — a sync WebGPU shader compile here left the
+        // window stuck at the default 300×150 bitmap.
+        world.insert_resource(OcrCheckpointSource(
+            "loading WebGPU recognizer…".to_string(),
+        ));
         world.insert_non_send(OcrClient {
-            engine,
+            engine: None,
             pending: None,
             writing,
             gpu,
             next_id: 0,
             inflight: None,
-            is_vlm,
+            is_vlm: false,
         });
         return;
     }
@@ -250,6 +253,47 @@ fn setup_recognizer(world: &mut World) {
             is_vlm,
         });
     }
+}
+
+#[cfg(target_arch = "wasm32")]
+fn finish_wasm_ocr_load(
+    mut client: NonSendMut<OcrClient>,
+    mut source: ResMut<OcrCheckpointSource>,
+    checkpoint: Option<ResMut<WasmCheckpoint>>,
+    mut frames: Local<u8>,
+) {
+    if client.engine.is_some() {
+        return;
+    }
+    if *frames < 3 {
+        *frames += 1;
+        if *frames == 3 {
+            let fetched = checkpoint.and_then(|mut ckpt| ckpt.0.take());
+            crate::log("ocr: initializing WebGPU for HAT in the background…");
+            wasm_bindgen_futures::spawn_local(async move {
+                hwr_model::init_wgpu().await;
+                crate::log("ocr: compiling HAT on WebGPU…");
+                let (engine, loaded) = load_recognizer(fetched.as_deref());
+                WASM_OCR.with(|slot| {
+                    *slot.borrow_mut() = Some((engine, loaded));
+                });
+            });
+        }
+        return;
+    }
+    let Some((engine, loaded)) = WASM_OCR.with(|slot| slot.borrow_mut().take()) else {
+        return;
+    };
+    client.is_vlm = engine.is_vlm();
+    client.engine = Some(engine);
+    source.0 = loaded.clone();
+    crate::log(&format!("ocr: loaded {loaded}"));
+}
+
+#[cfg(target_arch = "wasm32")]
+thread_local! {
+    static WASM_OCR: std::cell::RefCell<Option<(OcrEngine, String)>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -402,6 +446,20 @@ fn load_hat(fetched: Option<&[u8]>) -> (OcrEngine, String) {
             "random (HAT, no web checkpoint)".to_string(),
         )
     }
+}
+
+#[cfg(feature = "vlm")]
+pub fn load_vlm_ocr() -> Result<(crate::vlm::VlmOcr, String), String> {
+    let Some(dir) = vlm_model_dir() else {
+        return Err(
+            "No HunyuanOCR checkpoint found. Set HWR_VL_MODEL_DIR or put weights in models/HunyuanOCR."
+                .to_string(),
+        );
+    };
+    let device = std::env::var("HWR_VL_DEVICE").unwrap_or_else(|_| "metal".to_string());
+    let vlm = crate::vlm::VlmOcr::load(&dir, device.trim())?;
+    let source = vlm.label(&dir, device.trim());
+    Ok((vlm, source))
 }
 
 fn load_vlm_or_explain(fetched: Option<&[u8]>) -> (OcrEngine, String) {

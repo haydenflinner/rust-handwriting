@@ -19,7 +19,7 @@ pub fn latex_to_typst(raw: &str) -> String {
     }
 
     match mitex::convert_text(src, None) {
-        Ok(text) if !text.trim().is_empty() => text.trim().to_string(),
+        Ok(text) if !text.trim().is_empty() => polish_typst(text.trim()),
         Ok(_) | Err(_) => convert_math_pretty(src),
     }
 }
@@ -90,9 +90,105 @@ fn looks_like_latex_math(s: &str) -> bool {
 
 fn convert_math_pretty(src: &str) -> String {
     match mitex::convert_math(src, None) {
-        Ok(body) => wrap_typst_math(body.trim()),
+        Ok(body) => wrap_typst_math(&polish_typst(body.trim())),
         Err(err) => format!("// mitex: {err}"),
     }
+}
+
+/// Mitex emits package helpers (`mitexsqrt`, …) instead of vanilla Typst.
+/// Strip the sqrt helper so the panel is copy-pasteable without `#import`.
+fn polish_typst(src: &str) -> String {
+    rewrite_mitexsqrt(src)
+}
+
+fn rewrite_mitexsqrt(src: &str) -> String {
+    const NEEDLE: &str = "mitexsqrt(";
+    let mut out = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(pos) = rest.find(NEEDLE) {
+        out.push_str(&rest[..pos]);
+        let after = &rest[pos + NEEDLE.len()..];
+        match closing_paren(after) {
+            Some((inner, consumed)) => {
+                let inner = rewrite_mitexsqrt(inner);
+                out.push_str(&sqrt_call_to_typst(&inner));
+                rest = &after[consumed..];
+            }
+            None => {
+                out.push_str(NEEDLE);
+                rest = after;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn sqrt_call_to_typst(inner: &str) -> String {
+    let args = split_top_level_args(inner);
+    match args.as_slice() {
+        [only] => match unwrap_escaped_brackets(only.trim()) {
+            Some(index) => format!("root({}, )", index.trim()),
+            None => format!("sqrt({})", only.trim()),
+        },
+        [index, radicand] => {
+            let index = unwrap_escaped_brackets(index.trim()).unwrap_or(index.trim());
+            format!("root({}, {})", index.trim(), radicand.trim())
+        }
+        _ => format!("sqrt({})", inner.trim()),
+    }
+}
+
+fn unwrap_escaped_brackets(s: &str) -> Option<&str> {
+    s.strip_prefix(r"\[")?.strip_suffix(r"\]")
+}
+
+fn split_top_level_args(inner: &str) -> Vec<&str> {
+    let mut args = Vec::new();
+    let mut start = 0;
+    let mut depth: u32 = 0;
+    let mut escaped = false;
+    for (i, c) in inner.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => depth = depth.saturating_sub(1),
+            ',' if depth == 0 => {
+                args.push(&inner[start..i]);
+                start = i + c.len_utf8();
+            }
+            _ => {}
+        }
+    }
+    args.push(&inner[start..]);
+    args
+}
+
+fn closing_paren(s: &str) -> Option<(&str, usize)> {
+    let mut depth: u32 = 1;
+    let mut escaped = false;
+    for (i, c) in s.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match c {
+            '\\' => escaped = true,
+            '(' => depth += 1,
+            ')' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((&s[..i], i + c.len_utf8()));
+                }
+            }
+            _ => {}
+        }
+    }
+    None
 }
 
 fn wrap_typst_math(body: &str) -> String {
@@ -126,5 +222,29 @@ mod tests {
     fn skips_status() {
         assert!(latex_to_typst("recognizing formula…").is_empty());
         assert!(latex_to_typst("").is_empty());
+    }
+
+    #[test]
+    fn sqrt_becomes_typst_sqrt() {
+        let typst = latex_to_typst(r"\sqrt{x}");
+        assert!(!typst.contains("mitexsqrt"), "{typst}");
+        assert!(typst.contains("sqrt("), "{typst}");
+        assert!(typst.starts_with('$') && typst.ends_with('$'), "{typst}");
+    }
+
+    #[test]
+    fn nth_root_becomes_typst_root() {
+        let typst = latex_to_typst(r"\sqrt[3]{8}");
+        assert!(!typst.contains("mitexsqrt"), "{typst}");
+        assert!(typst.contains("root("), "{typst}");
+        assert!(typst.contains("3"), "{typst}");
+        assert!(typst.contains("8"), "{typst}");
+    }
+
+    #[test]
+    fn nested_sqrt() {
+        let typst = latex_to_typst(r"\sqrt{\sqrt{x}}");
+        assert!(!typst.contains("mitexsqrt"), "{typst}");
+        assert!(typst.contains("sqrt("), "{typst}");
     }
 }

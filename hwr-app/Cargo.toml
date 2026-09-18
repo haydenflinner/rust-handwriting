@@ -15,14 +15,20 @@ bevy = { version = "0.19.1", features = ["system_font_discovery", "system_clipbo
 hwr-ink = { path = "../hwr-ink" }
 hwr-model = { path = "../hwr-model" }
 mitex = "0.2.4"
+typst = "0.13.1"
+typst-kit = { version = "0.13.1", default-features = false, features = ["fonts", "embed-fonts"] }
+typst-render = "0.13.1"
 image = { version = "0.25", optional = true }
 oar-ocr-vl = { path = "../oar-ocr/oar-ocr-vl", optional = true, default-features = false, features = ["metal"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tiny_http = "0.12"
 
 [target.'cfg(not(target_arch = "wasm32"))'.dependencies]
 dirs = "7.0.0"
 
 [target.'cfg(target_arch = "wasm32")'.dependencies]
-bevy = { version = "0.19.1", features = ["system_font_discovery", "system_clipboard", "webgpu"] }
+bevy = { version = "0.19.1", features = ["system_font_discovery", "system_clipboard"] }
 console_error_panic_hook = "0.1"
 js-sys = "0.3"
 wasm-bindgen = "0.2"

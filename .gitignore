@@ -22,6 +22,7 @@ Bonsai-demo/
 /lstm-online-handwriting.pdf
 /mnist-dataset.zip
 *.html
+!hwr-app/src/hunyuan_web.html
 *_files/
 
 # Generated at runtime: trained checkpoints, training logs, the live

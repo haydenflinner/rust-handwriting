@@ -10,9 +10,12 @@ mod review;
 mod storage;
 mod test_mode;
 mod typst_convert;
+mod typst_preview;
 mod ui_theme;
 #[cfg(feature = "vlm")]
 mod vlm;
+#[cfg(all(feature = "vlm", not(target_arch = "wasm32")))]
+mod web_server;
 mod writing_cell;
 
 use bevy::prelude::*;
@@ -20,6 +23,10 @@ use bevy::prelude::*;
 const BACKGROUND: Color = Color::srgb(0.08, 0.08, 0.1);
 
 fn main() {
+    #[cfg(all(feature = "vlm", not(target_arch = "wasm32")))]
+    if std::env::args().any(|arg| arg == "--web") {
+        web_server::run();
+    }
     #[cfg(target_arch = "wasm32")]
     {
         console_error_panic_hook::set_once();
@@ -36,8 +43,7 @@ fn main() {
 
 #[cfg(target_arch = "wasm32")]
 async fn start_web() -> Result<(), String> {
-    log("hwr: initializing WebGPU…");
-    hwr_model::init_wgpu().await;
+    log("hwr: starting Bevy…");
     let checkpoint = fetch_bytes("model.mpk").await;
     match &checkpoint {
         Some(bytes) => log(&format!("hwr: loaded model.mpk ({} bytes)", bytes.len())),

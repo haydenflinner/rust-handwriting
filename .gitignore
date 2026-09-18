@@ -1,4 +1,5 @@
 target/
+Bonsai-demo/
 
 # Vendored reference material / external checkouts — not our code, kept
 # locally for reading/comparison only. See third_party/ for the one

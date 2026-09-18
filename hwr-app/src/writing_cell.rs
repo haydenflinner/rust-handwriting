@@ -7,6 +7,9 @@
 //! interaction actually started on (and bubbles them to ancestors), so each
 //! cell only ever accumulates strokes drawn inside it — no manual hit-testing
 //! against cell bounds needed.
+//!
+//! A zigzag scribble over already-drawn letters is treated as an erase
+//! (see [`Ink::apply_scratch_out`]) instead of another stroke.
 
 use bevy::picking::pointer::PointerButton;
 use bevy::prelude::*;
@@ -138,12 +141,14 @@ fn on_release(
     let dt = cell.stroke_start.elapsed().as_secs_f32();
     cell.ink.push(pos.x, pos.y, dt);
     cell.ink.pen_up();
+    cell.ink.apply_scratch_out();
     cell.pen_down = false;
     cell.just_finished = true;
     writing.set(false);
 }
 
 const STROKE_COLOR: Color = Color::srgb(0.9, 0.9, 0.95);
+const ERASE_COLOR: Color = Color::srgb(0.95, 0.42, 0.38);
 
 /// Draw every cell's ink as connected line segments in screen space,
 /// including the in-progress stroke (so lines appear as you write, not only
@@ -169,11 +174,18 @@ fn draw_cell_ink(
         if !visibility.get() {
             continue;
         }
-        for stroke in cell.ink.strokes_with_open() {
+        let strokes: Vec<_> = cell.ink.strokes_with_open().collect();
+        let erase_preview = cell.pen_down && cell.ink.preview_scratch_out();
+        for (i, stroke) in strokes.iter().enumerate() {
+            let color = if erase_preview && i + 1 == strokes.len() {
+                ERASE_COLOR
+            } else {
+                STROKE_COLOR
+            };
             for pair in stroke.windows(2) {
                 let a = to_world(pair[0].x, pair[0].y);
                 let b = to_world(pair[1].x, pair[1].y);
-                gizmos.line_2d(a, b, STROKE_COLOR);
+                gizmos.line_2d(a, b, color);
             }
         }
     }

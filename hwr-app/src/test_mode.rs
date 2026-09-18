@@ -134,9 +134,11 @@ fn test_mode_hint(checkpoint: Option<&OcrCheckpointSource>, vlm: bool) -> String
         None => "recognized text appears below".to_string(),
     };
     if vlm {
-        format!("Write, then pick a Hunyuan task to re-run this ink. Space/Esc clears. {model}")
+        format!(
+            "Write, then pick a Hunyuan task to re-run this ink. Scribble over a letter to erase it. Space/Esc clears. {model}"
+        )
     } else {
-        format!("Write in the canvas — {model}")
+        format!("Write in the canvas. Scribble over a letter to erase it. {model}")
     }
 }
 
@@ -479,6 +481,13 @@ fn update_recognized_text(
 
     if cell.just_finished {
         cell.just_finished = false;
+        if cell.ink.is_empty() {
+            pending.ink = None;
+            state.forget_ink();
+            recognized.0.clear();
+            ocr.cancel();
+            return;
+        }
         if ocr.is_vlm() {
             pending.ink = Some(cell.ink.clone());
             pending.due = time.elapsed_secs() + VLM_DEBOUNCE;

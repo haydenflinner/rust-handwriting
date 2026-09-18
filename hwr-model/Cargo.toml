@@ -9,7 +9,10 @@ edition.workspace = true
 # paths ~hundreds of times faster with it on. The custom CubeCL LSTM
 # kernel needed fusion *off* (raw `CubeTensor`, not `FusionTensor`); that
 # kernel is no longer on the recognizer path, so fusion is back on.
-burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff", "fusion"] }
+#
+# Autodiff is native-only (training). Resolver 2 keeps that feature off
+# for wasm so the browser build doesn't pull Burn's training graph.
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "fusion"] }
 burn-cubecl = { version = "0.21.0", features = ["fusion"] }
 cubecl = { version = "0.10.0", features = ["wgpu"] }
 cgmath = "0.18"
@@ -17,6 +20,9 @@ hwr-ink = { path = "../hwr-ink" }
 partial_sort = "1.0.0"
 rand = { version = "0.10.2", default-features = false, features = ["std", "std_rng"] }
 strsim = "0.11.1"
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+burn = { version = "0.21.0", default-features = false, features = ["std", "wgpu", "autodiff", "fusion"] }
 # Hyperparameter search (see bin/tune.rs): a real TPE sampler instead of
 # hand-launched "variant A/B/C" parallel guesses. Pure-Rust; vendored under
 # third_party/ (see that Cargo.toml for why not the crates.io release or

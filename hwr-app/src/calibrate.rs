@@ -10,14 +10,11 @@
 //! `hwr_model::corpus::load_pairs` (and so by `hwr-model`'s `train` binary)
 //! for a future fine-tuning pass.
 
-use std::io::Write;
-use std::path::PathBuf;
-
 use bevy::prelude::*;
 
 use crate::mode::AppMode;
 use crate::prompts::{pages, Page};
-use crate::storage::calibration_file_path;
+use crate::storage;
 use crate::writing_cell::{make_writable, stop_write_bubbling, CellInk};
 
 pub struct CalibratePlugin;
@@ -25,7 +22,6 @@ pub struct CalibratePlugin;
 impl Plugin for CalibratePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(CalibrationSession::new())
-            .insert_resource(CalibrationLog(calibration_file_path()))
             .add_systems(Startup, setup_ui)
             .add_systems(OnEnter(AppMode::Calibrate), show_ui)
             .add_systems(OnExit(AppMode::Calibrate), hide_ui)
@@ -45,23 +41,6 @@ impl CalibrationSession {
             pages: pages(),
             current: 0,
         }
-    }
-}
-
-#[derive(Resource)]
-struct CalibrationLog(PathBuf);
-
-fn append_sample(path: &std::path::Path, text: &str, ink: &hwr_ink::ink::Ink) {
-    let result = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(path)
-        .and_then(|mut file| writeln!(file, "{text}\t{ink}"));
-    if let Err(err) = result {
-        eprintln!(
-            "failed to save calibration sample to {}: {err}",
-            path.display()
-        );
     }
 }
 
@@ -221,13 +200,12 @@ fn save_page_button(parent: &mut ChildSpawnerCommands) {
         .observe(
             move |mut trigger: On<Pointer<Click>>,
                   mut cells: Query<(&mut CellInk, &CalibrationCell, &Children)>,
-                  log: Res<CalibrationLog>,
                   children_q: Query<&Children>,
                   mut count_texts: Query<&mut Text, With<CountLabel>>| {
                 trigger.propagate(false);
                 for (mut cell, prompt, children) in &mut cells {
                     if !cell.ink.is_empty() {
-                        append_sample(&log.0, &prompt.0, &cell.ink);
+                        storage::append_calibration_sample(&prompt.0, &cell.ink);
                         cell.saved_count += 1;
                         update_count_label(
                             children,

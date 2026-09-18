@@ -9,16 +9,15 @@
 //! like handwriting anymore, which is a lot faster to notice than staring at
 //! rows of floats.
 
-use std::path::Path;
-
 use bevy::prelude::*;
 use bevy::window::PrimaryWindow;
 
 use hwr_ink::ink::Ink;
+#[cfg(not(target_arch = "wasm32"))]
 use hwr_model::corpus;
 
 use crate::mode::AppMode;
-use crate::storage::calibration_file_path;
+use crate::storage;
 
 const ENTRIES_PER_PAGE: usize = 40;
 const INK_COLOR: Color = Color::srgb(0.4, 0.9, 0.6);
@@ -65,27 +64,30 @@ impl ReviewSession {
 fn build_pages() -> Vec<ReviewPageData> {
     let mut sources: Vec<(String, Vec<(String, Ink)>)> = Vec::new();
 
-    match corpus::load_pairs(calibration_file_path()) {
-        Ok(pairs) if !pairs.is_empty() => sources.push(("My calibration data".to_string(), pairs)),
-        _ => {}
+    let pairs = storage::load_calibration_pairs();
+    if !pairs.is_empty() {
+        sources.push(("My calibration data".to_string(), pairs));
     }
 
-    let armrest_inks = Path::new("armrest/data/inks");
-    for name in [
-        "jabberwocky.txt",
-        "prufrock.txt",
-        "if-commands.txt",
-        "if-transcript.txt",
-    ] {
-        let path = armrest_inks.join(name);
-        match corpus::load_pairs(&path) {
-            Ok(pairs) if !pairs.is_empty() => sources.push((name.to_string(), pairs)),
-            Ok(_) => {}
-            Err(err) => eprintln!(
-                "review: couldn't load {} ({err}) — run `cargo run -p hwr-app` from the \
-                 workspace root to see armrest's bundled corpus here",
-                path.display()
-            ),
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        let armrest_inks = std::path::Path::new("armrest/data/inks");
+        for name in [
+            "jabberwocky.txt",
+            "prufrock.txt",
+            "if-commands.txt",
+            "if-transcript.txt",
+        ] {
+            let path = armrest_inks.join(name);
+            match corpus::load_pairs(&path) {
+                Ok(pairs) if !pairs.is_empty() => sources.push((name.to_string(), pairs)),
+                Ok(_) => {}
+                Err(err) => eprintln!(
+                    "review: couldn't load {} ({err}) — run `cargo run -p hwr-app` from the \
+                     workspace root to see armrest's bundled corpus here",
+                    path.display()
+                ),
+            }
         }
     }
 

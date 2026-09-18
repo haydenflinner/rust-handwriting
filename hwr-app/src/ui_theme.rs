@@ -20,3 +20,12 @@ pub fn result_font(size: f32) -> TextFont {
         ..default()
     }
 }
+
+pub fn ui_font_semibold(size: f32) -> TextFont {
+    TextFont {
+        font: FontSource::SystemUi,
+        font_size: FontSize::Px(size),
+        weight: FontWeight::SEMIBOLD,
+        ..default()
+    }
+}

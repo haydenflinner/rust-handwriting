@@ -1,0 +1,4 @@
+# getrandom 0.2 needs this cfg; 0.3/0.4 prefer the `wasm_js` cargo feature
+# (also enabled from hwr-app) but still accept the flag.
+[target.wasm32-unknown-unknown]
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']

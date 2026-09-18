@@ -11,12 +11,30 @@ default = ["vlm"]
 vlm = ["dep:oar-ocr-vl", "dep:image"]
 
 [dependencies]
-bevy = { version = "0.19.1", features = ["system_font_discovery"] }
-dirs = "7.0.0"
+bevy = { version = "0.19.1", features = ["system_font_discovery", "system_clipboard"] }
 hwr-ink = { path = "../hwr-ink" }
 hwr-model = { path = "../hwr-model" }
+mitex = "0.2.4"
 image = { version = "0.25", optional = true }
 oar-ocr-vl = { path = "../oar-ocr/oar-ocr-vl", optional = true, default-features = false, features = ["metal"] }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+dirs = "7.0.0"
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+bevy = { version = "0.19.1", features = ["system_font_discovery", "system_clipboard", "webgpu"] }
+console_error_panic_hook = "0.1"
+js-sys = "0.3"
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4"
+web-sys = { version = "0.3", features = ["Window", "Response", "Storage", "console"] }
+# Force JS entropy backends for every getrandom major that the tree may unify.
+getrandom = { version = "0.2", features = ["js"] }
+getrandom_03 = { package = "getrandom", version = "0.3", features = ["wasm_js"] }
+getrandom_04 = { package = "getrandom", version = "0.4", features = ["wasm_js"] }
+
+[package.metadata.bevy_cli.web]
+default-features = false
 
 [[bin]]
 name = "hwr-app"

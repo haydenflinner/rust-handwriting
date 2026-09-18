@@ -2,15 +2,20 @@
 
 use std::collections::HashMap;
 
+use bevy::clipboard::Clipboard;
 use bevy::input::mouse::MouseScrollUnit;
+use bevy::input_focus::InputFocus;
 use bevy::prelude::*;
+use bevy::text::{EditableText, LineBreak, TextCursorStyle};
+use bevy::ui::widget::TextScroll;
 
 use hwr_ink::ink::Ink;
 
 use crate::hunyuan_tasks::{self, HunyuanTask, TASKS};
 use crate::mode::AppMode;
 use crate::ocr::{OcrCheckpointSource, OcrClient, UiPointerDown};
-use crate::ui_theme::{result_font, ui_font};
+use crate::typst_convert::latex_to_typst;
+use crate::ui_theme::{result_font, ui_font, ui_font_semibold};
 use crate::writing_cell::{make_writable, stop_write_bubbling, CellInk};
 
 /// Pause after the last pen-up before calling a VLM, so several digits or
@@ -22,12 +27,22 @@ const OPTION_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.08);
 const OPTION_SELECTED_BG: Color = Color::srgba(0.35, 0.55, 0.95, 0.4);
 const CARD_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.06);
 const CARD_SELECTED_BG: Color = Color::srgba(0.35, 0.55, 0.95, 0.22);
+const PANEL_BG: Color = Color::srgba(0.06, 0.06, 0.09, 0.94);
+const PANEL_BORDER: Color = Color::srgba(1.0, 1.0, 1.0, 0.12);
+const OUTPUT_CARD_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.05);
+const FIELD_BG: Color = Color::srgba(0.02, 0.02, 0.04, 0.72);
+const COPY_BG: Color = Color::srgba(1.0, 1.0, 1.0, 0.12);
+const COPY_FLASH_BG: Color = Color::srgba(0.35, 0.72, 0.48, 0.45);
+const LATEX_ACCENT: Color = Color::srgb(0.45, 0.72, 0.98);
+const TYPST_ACCENT: Color = Color::srgb(0.96, 0.72, 0.38);
+const COPY_FLASH_SECS: f32 = 1.25;
 
 pub struct TestModePlugin;
 
 impl Plugin for TestModePlugin {
     fn build(&self, app: &mut App) {
         app.insert_resource(RecognizedText::default())
+            .insert_resource(TypstText::default())
             .insert_resource(PendingOcr::default())
             .insert_resource(VlTaskState::default())
             .add_systems(Startup, setup_ui)
@@ -36,10 +51,12 @@ impl Plugin for TestModePlugin {
             .add_systems(
                 Update,
                 (
+                    unfocus_when_writing,
                     clear_on_key,
                     update_recognized_text,
                     sync_task_dropdown,
                     sync_result_ui,
+                    sync_copy_buttons,
                 )
                     .chain()
                     .run_if(in_state(AppMode::Test)),
@@ -49,6 +66,31 @@ impl Plugin for TestModePlugin {
 
 #[derive(Resource, Default)]
 struct RecognizedText(String);
+
+#[derive(Resource, Default)]
+struct TypstText(String);
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OutputKind {
+    Latex,
+    Typst,
+}
+
+impl OutputKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Latex => "LaTeX",
+            Self::Typst => "Typst",
+        }
+    }
+
+    fn accent(self) -> Color {
+        match self {
+            Self::Latex => LATEX_ACCENT,
+            Self::Typst => TYPST_ACCENT,
+        }
+    }
+}
 
 #[derive(Resource, Default)]
 struct PendingOcr {
@@ -102,7 +144,16 @@ struct TestCanvas;
 struct TestUiRoot;
 
 #[derive(Component)]
-struct RecognizedTextLabel;
+struct OutputField(OutputKind);
+
+#[derive(Component)]
+struct CopyButton {
+    kind: OutputKind,
+    copied_until: f32,
+}
+
+#[derive(Component)]
+struct CopyButtonLabel;
 
 #[derive(Component)]
 struct TaskMenuHeaderLabel;
@@ -135,10 +186,12 @@ fn test_mode_hint(checkpoint: Option<&OcrCheckpointSource>, vlm: bool) -> String
     };
     if vlm {
         format!(
-            "Write, then pick a Hunyuan task to re-run this ink. Scribble over a letter to erase it. Space/Esc clears. {model}"
+            "Write, then pick a Hunyuan task to re-run this ink. Select output to copy, or use Copy. Scribble over a letter to erase it. Space/Esc clears. {model}"
         )
     } else {
-        format!("Write in the canvas. Scribble over a letter to erase it. {model}")
+        format!(
+            "Write in the canvas. Select output to copy, or use Copy. Scribble over a letter to erase it. Space/Esc clears. {model}"
+        )
     }
 }
 
@@ -171,13 +224,23 @@ fn setup_ui(
                 top: Val::Px(12.0),
                 left: Val::Px(12.0),
                 flex_direction: FlexDirection::Column,
-                row_gap: Val::Px(6.0),
-                padding: UiRect::all(Val::Px(8.0)),
-                width: Val::Px(440.0),
-                max_height: Val::Vh(72.0),
+                row_gap: Val::Px(10.0),
+                padding: UiRect::all(Val::Px(12.0)),
+                width: Val::Px(520.0),
+                max_height: Val::Vh(78.0),
+                border: UiRect::all(Val::Px(1.0)),
+                border_radius: BorderRadius::all(Val::Px(14.0)),
                 ..default()
             },
-            BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.55)),
+            BackgroundColor(PANEL_BG),
+            BorderColor::all(PANEL_BORDER),
+            BoxShadow::new(
+                Color::srgba(0.0, 0.0, 0.0, 0.4),
+                Val::Px(0.0),
+                Val::Px(10.0),
+                Val::Px(0.0),
+                Val::Px(22.0),
+            ),
             Pickable::IGNORE,
             GlobalZIndex(10),
         ))
@@ -211,12 +274,8 @@ fn spawn_results_scroll(parent: &mut ChildSpawnerCommands, vlm: bool) {
         BackgroundColor(Color::srgba(0.0, 0.0, 0.0, 0.15)),
     ));
     scroll.with_children(|col| {
-        col.spawn((
-            Text::new(""),
-            result_font(18.0),
-            TextColor(Color::WHITE),
-            RecognizedTextLabel,
-        ));
+        spawn_output_card(col, OutputKind::Latex);
+        spawn_output_card(col, OutputKind::Typst);
         if vlm {
             for task in TASKS {
                 spawn_result_card(col, task);
@@ -225,6 +284,133 @@ fn spawn_results_scroll(parent: &mut ChildSpawnerCommands, vlm: bool) {
     });
     scroll.observe(scroll_overflow);
     stop_write_bubbling(&mut scroll);
+}
+
+fn spawn_output_card(parent: &mut ChildSpawnerCommands, kind: OutputKind) {
+    parent
+        .spawn((
+            Node {
+                flex_direction: FlexDirection::Column,
+                row_gap: Val::Px(6.0),
+                width: Val::Percent(100.0),
+                padding: UiRect::all(Val::Px(10.0)),
+                border: UiRect {
+                    left: Val::Px(3.0),
+                    ..default()
+                },
+                border_radius: BorderRadius::all(Val::Px(10.0)),
+                ..default()
+            },
+            BackgroundColor(OUTPUT_CARD_BG),
+            BorderColor {
+                left: kind.accent(),
+                ..default()
+            },
+        ))
+        .with_children(|card| {
+            card.spawn((
+                Node {
+                    flex_direction: FlexDirection::Row,
+                    justify_content: JustifyContent::SpaceBetween,
+                    align_items: AlignItems::Center,
+                    width: Val::Percent(100.0),
+                    column_gap: Val::Px(8.0),
+                    ..default()
+                },
+            ))
+            .with_children(|header| {
+                header.spawn((
+                    Text::new(kind.title()),
+                    ui_font_semibold(13.0),
+                    TextColor(kind.accent()),
+                    Pickable::IGNORE,
+                ));
+                spawn_copy_button(header, kind);
+            });
+
+            let mut field = card.spawn((
+                OutputField(kind),
+                Node {
+                    width: Val::Percent(100.0),
+                    min_height: Val::Px(72.0),
+                    padding: UiRect::all(Val::Px(8.0)),
+                    overflow: Overflow::scroll_y(),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
+                    ..default()
+                },
+                BackgroundColor(FIELD_BG),
+                EditableText {
+                    visible_lines: Some(5.0),
+                    allow_newlines: true,
+                    ..default()
+                },
+                TextLayout {
+                    linebreak: LineBreak::WordOrCharacter,
+                    ..default()
+                },
+                result_font(15.0),
+                TextColor(Color::srgb(0.94, 0.95, 0.98)),
+                TextCursorStyle {
+                    color: Color::srgb(0.92, 0.94, 0.98),
+                    selection_color: Color::srgba(0.35, 0.55, 0.95, 0.45),
+                    unfocused_selection_color: Color::srgba(0.35, 0.55, 0.95, 0.22),
+                    selected_text_color: Some(Color::WHITE),
+                },
+                TextScroll::default(),
+            ));
+            stop_write_bubbling(&mut field);
+        });
+}
+
+fn spawn_copy_button(parent: &mut ChildSpawnerCommands, kind: OutputKind) {
+    let mut button = parent.spawn((
+        Button,
+        CopyButton {
+            kind,
+            copied_until: 0.0,
+        },
+        Node {
+            padding: UiRect::axes(Val::Px(10.0), Val::Px(4.0)),
+            border: UiRect::all(Val::Px(1.0)),
+            border_radius: BorderRadius::all(Val::Px(7.0)),
+            ..default()
+        },
+        BackgroundColor(COPY_BG),
+        BorderColor::all(Color::srgba(1.0, 1.0, 1.0, 0.14)),
+    ));
+    button
+        .with_children(|b| {
+            b.spawn((
+                Text::new("Copy"),
+                ui_font_semibold(12.0),
+                TextColor(Color::WHITE),
+                CopyButtonLabel,
+                Pickable::IGNORE,
+            ));
+        })
+        .observe(
+            |mut trigger: On<Pointer<Click>>,
+             mut buttons: Query<&mut CopyButton>,
+             recognized: Res<RecognizedText>,
+             typst: Res<TypstText>,
+             mut clipboard: ResMut<Clipboard>,
+             time: Res<Time>| {
+                trigger.propagate(false);
+                let Ok(mut button) = buttons.get_mut(trigger.entity) else {
+                    return;
+                };
+                let text = match button.kind {
+                    OutputKind::Latex => recognized.0.as_str(),
+                    OutputKind::Typst => typst.0.as_str(),
+                };
+                if let Err(err) = clipboard.set_text(text) {
+                    eprintln!("clipboard: {err}");
+                    return;
+                }
+                button.copied_until = time.elapsed_secs() + COPY_FLASH_SECS;
+            },
+        );
+    stop_write_bubbling(&mut button);
 }
 
 fn spawn_result_card(parent: &mut ChildSpawnerCommands, task: &'static HunyuanTask) {
@@ -237,6 +423,7 @@ fn spawn_result_card(parent: &mut ChildSpawnerCommands, task: &'static HunyuanTa
                 row_gap: Val::Px(4.0),
                 width: Val::Percent(100.0),
                 padding: UiRect::all(Val::Px(8.0)),
+                border_radius: BorderRadius::all(Val::Px(8.0)),
                 ..default()
             },
             BackgroundColor(CARD_BG),
@@ -275,6 +462,7 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                 Node {
                     padding: UiRect::axes(Val::Px(10.0), Val::Px(6.0)),
                     width: Val::Percent(100.0),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
                     ..default()
                 },
                 BackgroundColor(Color::srgba(1.0, 1.0, 1.0, 0.14)),
@@ -307,6 +495,7 @@ fn spawn_task_dropdown(parent: &mut ChildSpawnerCommands) {
                     width: Val::Percent(100.0),
                     max_height: Val::Vh(40.0),
                     overflow: Overflow::scroll_y(),
+                    border_radius: BorderRadius::all(Val::Px(8.0)),
                     ..default()
                 },
                 ScrollPosition::default(),
@@ -379,6 +568,26 @@ fn scroll_overflow(
     scroll_position.y = (scroll_position.y - dy).clamp(0.0, range);
 }
 
+fn unfocus_when_writing(
+    canvas: Query<&CellInk, With<TestCanvas>>,
+    mut focus: ResMut<InputFocus>,
+    fields: Query<Entity, With<OutputField>>,
+) {
+    let Ok(cell) = canvas.single() else {
+        return;
+    };
+    if !cell.is_writing() {
+        return;
+    }
+    if focus.get().is_some_and(|entity| fields.get(entity).is_ok()) {
+        focus.clear();
+    }
+}
+
+fn output_field_focused(focus: &InputFocus, fields: &Query<Entity, With<OutputField>>) -> bool {
+    focus.get().is_some_and(|entity| fields.get(entity).is_ok())
+}
+
 fn show_ui(mut roots: Query<&mut Visibility, Or<(With<TestUiRoot>, With<TestCanvas>)>>) {
     for mut vis in &mut roots {
         *vis = Visibility::Inherited;
@@ -428,7 +637,15 @@ fn clear_on_key(
     mut scroll: Query<&mut ScrollPosition, With<ResultsScroll>>,
     ocr: Option<NonSendMut<OcrClient>>,
     writing: Res<UiPointerDown>,
+    mut focus: ResMut<InputFocus>,
+    fields: Query<Entity, With<OutputField>>,
 ) {
+    if output_field_focused(&focus, &fields) {
+        if keys.just_pressed(KeyCode::Escape) {
+            focus.clear();
+        }
+        return;
+    }
     if keys.just_pressed(KeyCode::Space) || keys.just_pressed(KeyCode::Escape) {
         pending.ink = None;
         state.forget_ink();
@@ -616,18 +833,26 @@ fn sync_task_dropdown(
 
 fn sync_result_ui(
     recognized: Res<RecognizedText>,
+    mut typst: ResMut<TypstText>,
     state: Res<VlTaskState>,
-    mut labels: Query<&mut Text, With<RecognizedTextLabel>>,
+    mut fields: Query<(&OutputField, &mut EditableText)>,
     mut cards: Query<(&TaskResultCard, &mut Visibility, &mut BackgroundColor)>,
-    mut bodies: Query<(&TaskResultBody, &mut Text), Without<RecognizedTextLabel>>,
+    mut bodies: Query<(&TaskResultBody, &mut Text)>,
 ) {
     let current = if recognized.0.is_empty() {
         String::new()
     } else {
         recognized.0.clone()
     };
-    for mut label in &mut labels {
-        label.0 = current.clone();
+    if recognized.is_changed() {
+        typst.0 = latex_to_typst(&current);
+    }
+    for (field, mut editable) in &mut fields {
+        let next = match field.0 {
+            OutputKind::Latex => current.as_str(),
+            OutputKind::Typst => typst.0.as_str(),
+        };
+        set_editable_text(&mut editable, next);
     }
 
     for (card, mut vis, mut bg) in &mut cards {
@@ -645,5 +870,35 @@ fn sync_result_ui(
     }
     for (body, mut text) in &mut bodies {
         text.0 = state.results.get(body.0).cloned().unwrap_or_default();
+    }
+}
+
+fn set_editable_text(editable: &mut EditableText, next: &str) {
+    if editable.value().to_string() == next {
+        return;
+    }
+    editable.editor.set_text(next);
+    editable.pending_edits.clear();
+    editable.pending_paste = None;
+}
+
+fn sync_copy_buttons(
+    time: Res<Time>,
+    mut buttons: Query<(&CopyButton, &mut BackgroundColor, &Children)>,
+    mut labels: Query<&mut Text, With<CopyButtonLabel>>,
+) {
+    let now = time.elapsed_secs();
+    for (button, mut bg, children) in &mut buttons {
+        let copied = button.copied_until > now;
+        *bg = BackgroundColor(if copied { COPY_FLASH_BG } else { COPY_BG });
+        for child in children {
+            if let Ok(mut text) = labels.get_mut(*child) {
+                text.0 = if copied {
+                    "Copied".to_string()
+                } else {
+                    "Copy".to_string()
+                };
+            }
+        }
     }
 }

@@ -7,9 +7,13 @@
 //! A kernel already dispatched cannot be cancelled — the GPU runs it to
 //! completion. The token only decides who may *start* the next chunk.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+#[cfg(not(target_arch = "wasm32"))]
+use std::sync::atomic::Ordering;
 use std::sync::{Arc, Condvar, Mutex};
+#[cfg(not(target_arch = "wasm32"))]
 use std::thread;
+#[cfg(not(target_arch = "wasm32"))]
 use std::time::Duration;
 
 use bevy::prelude::*;
@@ -17,6 +21,7 @@ use bevy::render::{Render, RenderApp, RenderSystems};
 
 /// Park while the user is writing so Hunyuan does not occupy the GPU
 /// for the duration of a stroke.
+#[cfg(not(target_arch = "wasm32"))]
 pub fn wait_while_writing(writing: &AtomicBool) {
     while writing.load(Ordering::Acquire) {
         thread::sleep(Duration::from_millis(4));
@@ -34,6 +39,7 @@ struct GpuState {
     owner: GpuOwner,
     /// Bevy has entered acquire and is waiting or about to mark itself owner.
     /// OCR must not steal `Free` in that window.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
     bevy_waiting: u32,
 }
 
@@ -67,6 +73,7 @@ impl GpuGate {
     ///
     /// A failed try still sets `bevy_waiting` so OCR yields after the kernel
     /// instead of starving the swapchain for the whole job.
+    #[cfg(not(target_arch = "wasm32"))]
     fn bevy_try_acquire(&self) -> bool {
         let mut state = self.lock();
         if state.owner == GpuOwner::Ocr {
@@ -91,6 +98,14 @@ impl GpuGate {
     }
 
     pub fn ocr_acquire(&self, writing: &AtomicBool) {
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = writing;
+            let mut state = self.lock();
+            state.owner = GpuOwner::Ocr;
+            return;
+        }
+        #[cfg(not(target_arch = "wasm32"))]
         loop {
             wait_while_writing(writing);
             let mut state = self.lock();
@@ -169,7 +184,16 @@ fn skip_gpu_frame(skip: Res<SkipGpuFrame>) -> bool {
 }
 
 fn gpu_bevy_acquire(gate: Res<GpuGate>, mut skip: ResMut<SkipGpuFrame>) {
-    skip.0 = !gate.bevy_try_acquire();
+    #[cfg(target_arch = "wasm32")]
+    {
+        let _ = gate;
+        skip.0 = false;
+        return;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    {
+        skip.0 = !gate.bevy_try_acquire();
+    }
 }
 
 fn gpu_bevy_release(gate: Res<GpuGate>) {

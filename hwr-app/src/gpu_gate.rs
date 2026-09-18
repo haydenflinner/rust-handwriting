@@ -61,15 +61,25 @@ impl GpuGate {
         self.0.state.lock().unwrap_or_else(|err| err.into_inner())
     }
 
-    fn bevy_acquire(&self) {
+    /// Take the GPU for this Bevy frame, or fail immediately if OCR is in a
+    /// kernel. Never park the render thread: pipelined extract waits on it,
+    /// so a condvar stall here froze input while Hunyuan ran.
+    ///
+    /// A failed try still sets `bevy_waiting` so OCR yields after the kernel
+    /// instead of starving the swapchain for the whole job.
+    fn bevy_try_acquire(&self) -> bool {
         let mut state = self.lock();
-        state.bevy_waiting += 1;
-        while state.owner == GpuOwner::Ocr {
-            state = self.0.cv.wait(state).unwrap_or_else(|err| err.into_inner());
+        if state.owner == GpuOwner::Ocr {
+            if state.bevy_waiting == 0 {
+                state.bevy_waiting = 1;
+                self.0.cv.notify_all();
+            }
+            return false;
         }
         state.owner = GpuOwner::Bevy;
-        state.bevy_waiting -= 1;
+        state.bevy_waiting = 0;
         self.0.cv.notify_all();
+        true
     }
 
     fn bevy_release(&self) {
@@ -136,13 +146,30 @@ impl Plugin for GpuGatePlugin {
             return;
         };
         render_app.insert_resource(gate);
+        render_app.init_resource::<SkipGpuFrame>();
         render_app.add_systems(First, gpu_bevy_acquire);
-        render_app.add_systems(Render, gpu_bevy_release.after(RenderSystems::Render));
+        // Skip wgpu submit/present while OCR holds Metal — overlapping
+        // command buffers were the pink-blank hitch. The previous frame stays
+        // on screen until Hunyuan yields.
+        render_app.configure_sets(Render, RenderSystems::Render.run_if(not(skip_gpu_frame)));
+        render_app.add_systems(
+            Render,
+            gpu_bevy_release
+                .after(RenderSystems::Render)
+                .run_if(not(skip_gpu_frame)),
+        );
     }
 }
 
-fn gpu_bevy_acquire(gate: Res<GpuGate>) {
-    gate.bevy_acquire();
+#[derive(Resource, Default)]
+struct SkipGpuFrame(bool);
+
+fn skip_gpu_frame(skip: Res<SkipGpuFrame>) -> bool {
+    skip.0
+}
+
+fn gpu_bevy_acquire(gate: Res<GpuGate>, mut skip: ResMut<SkipGpuFrame>) {
+    skip.0 = !gate.bevy_try_acquire();
 }
 
 fn gpu_bevy_release(gate: Res<GpuGate>) {

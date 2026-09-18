@@ -116,16 +116,18 @@ impl VlmOcr {
             }
         }
         let prompt = hunyuan_instruction(prompt);
+        let max_new_tokens = max_new_tokens();
         let start = Instant::now();
         gpu.ocr_acquire(writing);
         let _hold = gpu.ocr_hold();
         let outputs = self
             .model
-            .generate_with_step(&[image], &[prompt.as_str()], 256, || {
+            .generate_with_step(&[image], &[prompt.as_str()], max_new_tokens, || {
                 // Drain this layer's Metal work while we still hold the GPU
                 // token, then let Bevy render before the next layer/token.
                 let _ = self.model.device().synchronize();
                 gpu.ocr_release();
+                std::thread::yield_now();
                 wait_while_writing(writing);
                 gpu.ocr_acquire(writing);
             })
@@ -142,6 +144,16 @@ impl VlmOcr {
         );
         Ok(text)
     }
+}
+
+/// Handwriting fits in far fewer than Hunyuan's document-length 256. Spotting
+/// JSON on a dense page might truncate; override with `HWR_VL_MAX_TOKENS`.
+fn max_new_tokens() -> usize {
+    std::env::var("HWR_VL_MAX_TOKENS")
+        .ok()
+        .and_then(|raw| raw.trim().parse().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(96)
 }
 
 fn dflash_requested() -> bool {

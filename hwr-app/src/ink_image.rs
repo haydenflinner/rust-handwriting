@@ -6,10 +6,10 @@
 use hwr_ink::ink::Ink;
 use image::{Rgb, RgbImage};
 
-/// Long side of the letterboxed crop. PaddleOCR-VL's processor further
-/// smart-resizes toward `min_pixels` / `max_pixels`; 1280 keeps a line of
-/// handwriting sharp without blowing the token budget.
-const LONG_SIDE: u32 = 1280;
+/// Long side of the letterboxed crop. Hunyuan's processor still smart-resizes
+/// toward `min_pixels` / `max_pixels`; 1280 made a few handwritten words into
+/// a huge vision-token prefill. 768 stays sharp for a line of ink.
+const LONG_SIDE: u32 = 768;
 const MARGIN: f32 = 48.0;
 const MIN_SHORT_SIDE: f32 = 96.0;
 

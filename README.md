@@ -40,7 +40,12 @@ should transfer to other sequence models.
 We tested the general VLM path too (the app's `vlm` feature drives
 `oar-ocr-vl`/Candle backends, HunyuanOCR included). For handwriting
 specifically, **SmolVLM was the best of the VLMs we tried** — and at
-500M it is small enough to download on demand rather than bundle. For
-per-stroke online ink, though, the dedicated BiLSTM+CTC model above
+500M it is small enough to download on demand rather than bundle. Its
+weights need no conversion: `HuggingFaceTB/SmolVLM-500M-Instruct` is
+stock safetensors that transformers/mlx-vlm load directly, and
+`ggml-org` ships official GGUFs for llama.cpp. (It isn't wired into
+`oar-ocr-vl` here — that backend family covers HunyuanOCR, PaddleOCR-VL,
+GLM-OCR, etc. — so today SmolVLM runs through an external runner.)
+For per-stroke online ink, though, the dedicated BiLSTM+CTC model above
 remains the right tool: stroke-order information is simply unavailable
 to an image model.

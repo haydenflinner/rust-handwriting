@@ -37,15 +37,25 @@ should transfer to other sequence models.
 
 ## VLMs for handwriting
 
-We tested the general VLM path too (the app's `vlm` feature drives
-`oar-ocr-vl`/Candle backends, HunyuanOCR included). For handwriting
-specifically, **SmolVLM was the best of the VLMs we tried** — and at
-500M it is small enough to download on demand rather than bundle. Its
-weights need no conversion: `HuggingFaceTB/SmolVLM-500M-Instruct` is
-stock safetensors that transformers/mlx-vlm load directly, and
-`ggml-org` ships official GGUFs for llama.cpp. (It isn't wired into
-`oar-ocr-vl` here — that backend family covers HunyuanOCR, PaddleOCR-VL,
-GLM-OCR, etc. — so today SmolVLM runs through an external runner.)
+We tested the general VLM path too. A browser bake-off
+(Transformers.js + ONNX weights) pitted TrOCR-small, Florence-2-base
+(-ft and base), LFM2.5-VL-450M, and SmolVLM-500M against handwritten
+lines, equations, and code; **SmolVLM-500M was the best of the VLMs we
+tried** and the only one that transcribed several samples verbatim —
+and at 500M it is small enough to download on demand rather than
+bundle.
+
+Two catches for reproduction:
+
+- HF never shipped an official ONNX build; the browser path runs a
+  community export (`appleeatspi/pantrymax-smolvlm-500m-onnx-v2`,
+  Idefics3 arch), fetched straight from HF at load — no local
+  conversion needed. It only ships `q4`/`q4f16` variants; prefer `q4`,
+  since `q4f16` can exceed WebGPU's storage-buffer limit.
+- For non-browser use the stock HF safetensors work directly under
+  transformers/mlx-vlm, and `ggml-org` ships official GGUFs for
+  llama.cpp — but candle has no SmolVLM impl, so `oar-ocr-vl` (which
+  covers HunyuanOCR, PaddleOCR-VL, GLM-OCR, etc.) can't run it.
 For per-stroke online ink, though, the dedicated BiLSTM+CTC model above
 remains the right tool: stroke-order information is simply unavailable
 to an image model.

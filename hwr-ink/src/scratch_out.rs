@@ -3,7 +3,11 @@
 //!
 //! Detection is conservative so ordinary glyphs (`m`, `w`, `E`) are not
 //! mistaken for erasers: the new stroke must reverse direction several
-//! times *and* spend a large fraction of its length near earlier ink.
+//! times, re-cover the same ground on some axis at least three times,
+//! *and* spend a large fraction of its length near earlier ink. The
+//! re-covering test is what keeps cursive safe — loops and descender
+//! tails double back over a letter once, but only a real scratch-out
+//! sweeps the same span again and again.
 //! Multi-stroke letters (`t`, `i`, `=`) are clustered by nearby bounding
 //! boxes so scribbling the stem also takes the crossbar.
 
@@ -114,6 +118,9 @@ fn stroke_is_scratch_out_against(scribble: &[Point3<f32>], existing: &[Vec<Point
     if direction_reversals(scribble, min_seg) < 3 {
         return false;
     }
+    if retraced_fraction(scribble) < 0.5 {
+        return false;
+    }
     let existing_strokes: Vec<&[Point3<f32>]> = existing.iter().map(|s| s.as_slice()).collect();
     if fraction_near(scribble, &existing_strokes, radius) < 0.35 {
         return false;
@@ -148,6 +155,38 @@ fn direction_reversals(stroke: &[Point3<f32>], min_seg: f32) -> usize {
         acc = Vector2::new(0.0, 0.0);
     }
     reversals
+}
+
+/// Fraction of the stroke's extent — on whichever axis is more retraced —
+/// that three or more passes of the stroke cover. A scratch-out sweeps
+/// back and forth over the same span, so most of its extent is covered
+/// again and again; cursive only ever doubles back once over a small
+/// interval (an `e` loop, a `y`/`g`/`z` tail) while advancing.
+fn retraced_fraction(stroke: &[Point3<f32>]) -> f32 {
+    let (w, h) = bbox_size(stroke);
+    passes3_fraction(stroke, |p| p.x, w).max(passes3_fraction(stroke, |p| p.y, h))
+}
+
+fn passes3_fraction(stroke: &[Point3<f32>], axis: fn(&Point3<f32>) -> f32, span: f32) -> f32 {
+    if stroke.len() < 2 || span < 1.0 {
+        return 0.0;
+    }
+    let lo = stroke.iter().map(axis).fold(f32::INFINITY, f32::min);
+    const SAMPLES: usize = 64;
+    let covered = (0..SAMPLES)
+        .filter(|i| {
+            let t = lo + span * (*i as f32 + 0.5) / SAMPLES as f32;
+            let passes = stroke
+                .windows(2)
+                .filter(|pair| {
+                    let (a, b) = (axis(&pair[0]), axis(&pair[1]));
+                    t >= a.min(b) && t <= a.max(b)
+                })
+                .count();
+            passes >= 3
+        })
+        .count();
+    covered as f32 / SAMPLES as f32
 }
 
 fn polyline_len(stroke: &[Point3<f32>]) -> f32 {
@@ -380,6 +419,30 @@ mod tests {
             ink.is_empty(),
             "stem and crossbar are one letter and should both go"
         );
+    }
+
+    #[test]
+    fn cursive_tail_doubling_back_is_not_a_scribble() {
+        let mut ink = vertical_letter(10.0);
+        ink.append(vertical_letter(120.0), 0.5);
+        // A cursive descender tail (`y`, `g`, `z`) can sweep back under
+        // the earlier letters and curl — sharp turns near earlier ink —
+        // but it covers each part of its span at most twice rather than
+        // sweeping over the same ground again and again.
+        let mut t = 2.0;
+        for (x, y) in [
+            (10.0, 20.0),
+            (120.0, 25.0),
+            (15.0, 30.0),
+            (30.0, 38.0),
+            (12.0, 45.0),
+        ] {
+            ink.push(x, y, t);
+            t += 0.04;
+        }
+        ink.pen_up();
+        assert!(!ink.apply_scratch_out());
+        assert_eq!(ink.strokes().count(), 3);
     }
 
     #[test]

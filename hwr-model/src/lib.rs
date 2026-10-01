@@ -9,6 +9,7 @@ pub mod fused_lstm;
 // unwrap. Source stays in-tree for a no-fusion LSTM revival.
 // mod fused_lstm_kernel;
 pub mod model;
+pub mod onnet;
 pub mod pbt;
 #[cfg(not(target_arch = "wasm32"))]
 pub mod probe;

@@ -21,6 +21,8 @@ Bonsai-demo/
 /synthetic_handwriting.py
 /lstm-online-handwriting.pdf
 /mnist-dataset.zip
+/third_party/IAMhwr/
+__pycache__/
 *.html
 !hwr-app/src/hunyuan_web.html
 *_files/
@@ -37,3 +39,4 @@ Bonsai-demo/
 # large, regenerable via `augment`/`synth_glyphs`/whatever produced the
 # MNIST vector file, not source.
 /synthetic/
+/transformer-joint.pdf

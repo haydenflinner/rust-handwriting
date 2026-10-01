@@ -247,19 +247,20 @@ fn rebuild_grid_on_page_change(
 
     commands.entity(grid_entity).despawn_children();
     let prompts = page.prompts.clone();
+    let line_mode = page.line_mode;
     commands.entity(grid_entity).with_children(|parent| {
         for prompt in prompts {
-            spawn_cell(parent, prompt);
+            spawn_cell(parent, prompt, line_mode);
         }
     });
 }
 
-fn spawn_cell(parent: &mut ChildSpawnerCommands, prompt: String) {
+fn spawn_cell(parent: &mut ChildSpawnerCommands, prompt: String, line_mode: bool) {
     let mut cell = parent.spawn((
         CalibrationCell(prompt.clone()),
         Node {
-            width: Val::Px(130.0),
-            height: Val::Px(120.0),
+            width: if line_mode { Val::Percent(100.0) } else { Val::Px(130.0) },
+            height: if line_mode { Val::Px(110.0) } else { Val::Px(120.0) },
             flex_direction: FlexDirection::Column,
             justify_content: JustifyContent::SpaceBetween,
             padding: UiRect::all(Val::Px(6.0)),
@@ -282,10 +283,14 @@ fn spawn_cell(parent: &mut ChildSpawnerCommands, prompt: String) {
             header.spawn((
                 Text::new(prompt),
                 TextFont {
-                    font_size: FontSize::Px(18.0),
+                    font_size: FontSize::Px(if line_mode { 15.0 } else { 18.0 }),
                     ..default()
                 },
-                TextColor(Color::WHITE),
+                TextColor(if line_mode {
+                    Color::srgba(1.0, 1.0, 1.0, 0.75)
+                } else {
+                    Color::WHITE
+                }),
             ));
             header.spawn((
                 Text::new("×0"),

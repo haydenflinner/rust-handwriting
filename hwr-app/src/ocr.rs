@@ -44,6 +44,9 @@ struct OcrEngine {
 
 enum OcrBackend {
     Hat(Recognizer),
+    /// IAMhwr ONNET pretrained-lstm, imported from ONNX — weights embedded
+    /// at build time, no checkpoint file needed.
+    Onnet(hwr_model::onnet::Onnet),
     #[cfg(feature = "vlm")]
     Vlm(crate::vlm::VlmOcr),
 }
@@ -69,6 +72,12 @@ impl OcrEngine {
                 let _hold = gpu.ocr_hold();
                 rec.recognize_greedy(ink).map_err(|err| err.to_string())
             }
+            OcrBackend::Onnet(rec) => {
+                let _ = prompt;
+                gpu.ocr_acquire(writing);
+                let _hold = gpu.ocr_hold();
+                Ok(rec.recognize(ink))
+            }
             #[cfg(feature = "vlm")]
             OcrBackend::Vlm(vlm) => vlm.recognize(ink, writing, gpu, prompt),
         }
@@ -76,7 +85,7 @@ impl OcrEngine {
 
     fn is_vlm(&self) -> bool {
         match &self.inner {
-            OcrBackend::Hat(_) => false,
+            OcrBackend::Hat(_) | OcrBackend::Onnet(_) => false,
             #[cfg(feature = "vlm")]
             OcrBackend::Vlm(_) => true,
         }
@@ -351,7 +360,8 @@ fn load_recognizer(fetched: Option<&[u8]>) -> (OcrEngine, String) {
         "vlm" | "hunyuan" | "hunyuanocr" | "paddle" | "paddleocr-vl" | "paddleocr_vl" => {
             load_vlm_or_explain(fetched)
         }
-        "hat" | "ctc" => load_hat(fetched),
+        "hat" | "ctc" => load_hat(fetched).unwrap_or_else(random_hat),
+        "onnet" | "iamhwr" | "onnx" => load_onnet(),
         "" => {
             // Hunyuan is the default app backend when the vlm feature is on
             // and the checkpoint is on disk.
@@ -364,26 +374,51 @@ fn load_recognizer(fetched: Option<&[u8]>) -> (OcrEngine, String) {
                     "ocr: no HunyuanOCR dir found (set HWR_VL_MODEL_DIR or put weights in models/HunyuanOCR); using HAT"
                 );
             }
-            load_hat(fetched)
+            // A trained HAT checkpoint still wins; when none exists, fall
+            // back to the embedded IAMhwr model rather than random weights.
+            load_hat(fetched).unwrap_or_else(load_onnet)
         }
         other => {
-            eprintln!("ocr: unknown HWR_OCR_BACKEND={other:?}; using HAT");
-            load_hat(fetched)
+            eprintln!("ocr: unknown HWR_OCR_BACKEND={other:?}; using default");
+            load_hat(fetched).unwrap_or_else(load_onnet)
         }
     }
 }
 
-fn load_hat(fetched: Option<&[u8]>) -> (OcrEngine, String) {
+fn load_onnet() -> (OcrEngine, String) {
+    (
+        OcrEngine {
+            inner: OcrBackend::Onnet(hwr_model::onnet::Onnet::new()),
+        },
+        "onnet_lstm.onnx (IAMhwr pretrained-lstm)".to_string(),
+    )
+}
+
+/// Random-weight HAT — structurally correct but decodes garbage; only used
+/// for an explicit `HWR_OCR_BACKEND=hat` when no checkpoint loads.
+fn random_hat() -> (OcrEngine, String) {
+    (
+        OcrEngine {
+            inner: OcrBackend::Hat(
+                Recognizer::random().expect("failed to build random HAT recognizer"),
+            ),
+        },
+        "random (HAT, no trained checkpoint yet)".to_string(),
+    )
+}
+
+/// Some(engine, source) when a HAT checkpoint was found and loaded.
+fn load_hat(fetched: Option<&[u8]>) -> Option<(OcrEngine, String)> {
     if let Some(bytes) = fetched {
         if !bytes.is_empty() {
             match Recognizer::from_bytes(bytes) {
                 Ok(rec) => {
-                    return (
+                    return Some((
                         OcrEngine {
                             inner: OcrBackend::Hat(rec),
                         },
                         "model.mpk (web)".to_string(),
-                    );
+                    ));
                 }
                 Err(err) => crate::log(&format!("ocr: skipped fetched checkpoint: {err}")),
             }
@@ -397,54 +432,37 @@ fn load_hat(fetched: Option<&[u8]>) -> (OcrEngine, String) {
             }
             match Recognizer::load(&path) {
                 Ok(rec) => {
-                    return (
+                    return Some((
                         OcrEngine {
                             inner: OcrBackend::Hat(rec),
                         },
                         path.display().to_string(),
-                    );
+                    ));
                 }
                 Err(err) => eprintln!("ocr: skipped {}: {err}", path.display()),
             }
         }
-        let rec = match Recognizer::from_bytes(CHECKPOINT) {
-            Ok(rec) => rec,
+        match Recognizer::from_bytes(CHECKPOINT) {
+            Ok(rec) => {
+                return Some((
+                    OcrEngine {
+                        inner: OcrBackend::Hat(rec),
+                    },
+                    "embedded checkpoints/model.mpk".to_string(),
+                ));
+            }
             Err(err) => {
                 // Embedded `model.mpk` is the previous BiLSTM checkpoint; HAT
                 // is a different Module layout and will not load it.
-                eprintln!(
-                    "ocr: embedded checkpoint incompatible with HAT ({err}); using random weights until a HAT checkpoint is trained"
-                );
-                return (
-                    OcrEngine {
-                        inner: OcrBackend::Hat(
-                            Recognizer::random().expect("failed to build random HAT recognizer"),
-                        ),
-                    },
-                    "random (HAT, no trained checkpoint yet)".to_string(),
-                );
+                eprintln!("ocr: embedded checkpoint incompatible with HAT ({err})");
             }
-        };
-        return (
-            OcrEngine {
-                inner: OcrBackend::Hat(rec),
-            },
-            "embedded checkpoints/model.mpk".to_string(),
-        );
+        }
+        None
     }
     #[cfg(target_arch = "wasm32")]
     {
-        crate::log(
-            "ocr: no web checkpoint; using random HAT weights (serve web/model.mpk next to the app)",
-        );
-        (
-            OcrEngine {
-                inner: OcrBackend::Hat(
-                    Recognizer::random().expect("failed to build random HAT recognizer"),
-                ),
-            },
-            "random (HAT, no web checkpoint)".to_string(),
-        )
+        crate::log("ocr: no web checkpoint (serve web/model.mpk next to the app)");
+        None
     }
 }
 
@@ -495,9 +513,9 @@ fn load_vlm_or_explain(fetched: Option<&[u8]>) -> (OcrEngine, String) {
     #[cfg(not(feature = "vlm"))]
     {
         eprintln!(
-            "ocr: HWR_OCR_BACKEND requests a VLM, but this binary was built without `--features vlm`; using HAT"
+            "ocr: HWR_OCR_BACKEND requests a VLM, but this binary was built without `--features vlm`; using default"
         );
-        load_hat(fetched)
+        load_hat(fetched).unwrap_or_else(load_onnet)
     }
 }
 
